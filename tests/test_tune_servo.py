@@ -13,6 +13,7 @@ from dexhand_servo.tune_servo import TUNING, TuningAborted, restore_servo, tune_
 def rig():
     fake = FakeBus([FakeServo(3, position=450)])
     bus = SafeBus("/dev/fake", 1_000_000, latency_ms=2, serial_factory=fake.serial_factory)
+    bus.census = {}  # census taken: no HLS secondary IDs
     bus.open()
     yield fake, bus
     bus.close()
@@ -61,3 +62,53 @@ def test_packet_policy_limits_registers_and_values(rig) -> None:
                 bus.write_byte(3, address, value)
     assert fake.writes() == []
     assert bus.policy.name == "read-only"
+
+
+def test_refuses_unsupported_servo(rig, tmp_path) -> None:
+    fake, bus = rig
+    fake.servo(3).regs[2] = 7  # neither model
+    with pytest.raises(TuningAborted, match="unsupported"):
+        tune_servo(bus, 3, "x", yes, p_gain=20, directory=tmp_path)
+    assert fake.writes() == []
+
+
+def test_hls_tuning_uses_lock_55_and_hls_ranges(tmp_path) -> None:
+    from dexhand_servo.models import HLS3606
+
+    servo = FakeServo(3, position=2000, model=HLS3606)
+    fake = FakeBus([servo])
+    bus = SafeBus("/dev/fake", 1_000_000, latency_ms=2, serial_factory=fake.serial_factory)
+    bus.open()
+    with pytest.raises(TuningAborted, match="16..64"):
+        tune_servo(bus, 3, "x", yes, p_gain=10, directory=tmp_path)
+    assert bus.census == {0: frozenset({3})}, "census taken on the first command"
+    result = tune_servo(bus, 3, "x", yes, p_gain=40, directory=tmp_path)
+    assert result.verified, result.steps
+    assert fake.writes() == [(3, 55, 0), (3, 21, 40), (3, 55, 1)]
+    assert servo.regs[48:50] == bytes([0xE8, 0x03]), "torque limit untouched"
+    assert "power-cycle" in result.steps[-1]
+    original = json.loads((tmp_path / "id3_original.json").read_text(encoding="utf-8"))
+    assert (original["model"], original["p_gain"]) == ("hls3606", 32)
+    bus.close()
+
+
+def test_backup_records_model_and_restore_refuses_other_model(rig, tmp_path) -> None:
+    fake, bus = rig
+    tune_servo(bus, 3, "x", yes, p_gain=20, directory=tmp_path)
+    original = json.loads((tmp_path / "id3_original.json").read_text(encoding="utf-8"))
+    assert original["model"] == "scs0009"
+    original["model"] = "hls3606"  # as if the servo at ID 3 had been an HLS when tuned
+    (tmp_path / "id3_original.json").write_text(json.dumps(original), encoding="utf-8")
+    writes_before = len(fake.writes())
+    with pytest.raises(TuningAborted, match="do not apply"):
+        restore_servo(bus, 3, "x", yes, directory=tmp_path)
+    assert len(fake.writes()) == writes_before
+
+
+def test_policy_is_bound_to_one_servo(rig) -> None:
+    from dexhand_servo.tune_servo import TuningPolicy
+
+    fake, bus = rig
+    with bus.use_policy(TuningPolicy(servo_id=3)), pytest.raises(UnsafeOperationError, match="bound"):
+        bus.write_byte(4, 21, 20)
+    assert fake.writes() == []

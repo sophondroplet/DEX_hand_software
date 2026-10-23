@@ -99,9 +99,16 @@ class Segment:
         return self.t0 + self.duration
 
 
+Acceleration = float | Mapping[int, float] | None  # one value, or per joint (joints in different step units)
+
+
+def _per_joint(acceleration: Acceleration, servo_id: int) -> float | None:
+    return acceleration.get(servo_id) if isinstance(acceleration, Mapping) else acceleration
+
+
 def sync_duration(
     start: Mapping[int, float], goal: Mapping[int, float], max_speeds: Mapping[int, float],
-    min_duration: float, peak_factor: float = MIN_JERK_PEAK, acceleration: float | None = None,
+    min_duration: float, peak_factor: float = MIN_JERK_PEAK, acceleration: Acceleration = None,
 ) -> float:
     """Duration so that every joint stays under its speed (and acceleration) limit and all arrive together.
 
@@ -109,8 +116,9 @@ def sync_duration(
     planned move; otherwise long moves get clipped and joints leave the shared normalised curve.
     """
     needed = [peak_factor * abs(goal[i] - start[i]) / max_speeds[i] for i in goal]
-    if acceleration:
-        needed += [math.sqrt(MIN_JERK_PEAK_ACC * abs(goal[i] - start[i]) / acceleration) for i in goal]
+    for i in goal:
+        if acc := _per_joint(acceleration, i):
+            needed.append(math.sqrt(MIN_JERK_PEAK_ACC * abs(goal[i] - start[i]) / acc))
     return max([min_duration, *needed])
 
 
@@ -147,7 +155,7 @@ class MotionPlan:
 
 def plan_move(
     start: Mapping[int, float], goal: Mapping[int, float], max_speeds: Mapping[int, float],
-    now: float, min_duration: float, label: str, acceleration: float | None = None,
+    now: float, min_duration: float, label: str, acceleration: Acceleration = None,
 ) -> MotionPlan:
     goal = {i: float(goal[i]) for i in goal}
     start = {i: float(start[i]) for i in goal}
@@ -161,14 +169,18 @@ class Keyframe:
     positions: dict[int, int]
 
 
-def compress_keyframes(frames: Sequence[Keyframe], tolerance: int) -> list[Keyframe]:
-    """Keep a frame whenever any joint moved more than `tolerance` steps since the last kept one."""
+def compress_keyframes(frames: Sequence[Keyframe], tolerance: int | Mapping[int, int]) -> list[Keyframe]:
+    """Keep a frame whenever any joint moved more than `tolerance` steps since the last kept one.
+
+    `tolerance` is one value or one per joint (joints of different servo models use different steps).
+    """
     if not frames:
         return []
+    limit = (lambda i: tolerance[i]) if isinstance(tolerance, Mapping) else (lambda i: tolerance)
     kept = [frames[0]]
     for frame in frames[1:-1]:
         last = kept[-1].positions
-        if any(abs(frame.positions[i] - last[i]) > tolerance for i in frame.positions):
+        if any(abs(frame.positions[i] - last[i]) > limit(i) for i in frame.positions):
             kept.append(frame)
     if len(frames) > 1:
         kept.append(frames[-1])
@@ -177,7 +189,7 @@ def compress_keyframes(frames: Sequence[Keyframe], tolerance: int) -> list[Keyfr
 
 def plan_playback(
     keyframes: Sequence[Keyframe], start: Mapping[int, float], max_speeds: Mapping[int, float],
-    now: float, time_scale: float, min_duration: float, acceleration: float | None = None,
+    now: float, time_scale: float, min_duration: float, acceleration: Acceleration = None,
 ) -> MotionPlan:
     """Smooth approach from the actual position to frame 0, then the recorded path.
 

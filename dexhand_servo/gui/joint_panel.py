@@ -9,11 +9,11 @@ from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QGridLayout, QGroupBox, QHBoxLayout, QLabel, QPushButton, QSlider, QWidget
 
 from ..control.snapshot import JointState, describe_error
-from ..monitor import DEG_PER_STEP
 from . import theme
 
-LOAD_TOOLTIP = ("Load in % of maximum torque (register 60).\n"
-                "SCS0009 has no usable current reading (registers 69-70 always read 0), so load is shown instead.")
+LOAD_TOOLTIP = ("Load: drive duty in % of maximum (register 60).\n"
+                "HLS3606 joints also show the phase current (register 69); the SCS0009 has no usable current "
+                "reading (registers 69-70 always read 0).")
 
 
 class _NoWheel(QObject):
@@ -128,6 +128,7 @@ class JointPanel(QGroupBox):
         head.addWidget(self.torque_button)
         travel = QLabel(f"travel {lo}–{hi}")
         travel.setProperty("role", "muted")
+        self.travel = travel
 
         layout = QGridLayout(self)
         layout.addLayout(head, 0, 0)
@@ -147,6 +148,10 @@ class JointPanel(QGroupBox):
         self.slider.blockSignals(False)
 
     def update_state(self, state: JointState, slider_mode: bool) -> None:
+        if not state.online:
+            self._show_offline(state)
+            return
+        self.torque_button.setEnabled(True)
         r = state.reading
         armed = state.armed
         self._armed = armed
@@ -175,9 +180,11 @@ class JointPanel(QGroupBox):
             self._set_slider(r.position)
 
         self.bar.set_values(r.position if r else None, state.target if armed else None)
+        self.travel.setText(f"travel {self.lo}–{self.hi} · {state.model.label} steps")
         if r is not None:
-            self.values["pos"].setText(f"{r.position} ({r.position * DEG_PER_STEP:.1f}°)")
-            self.values["load"].setText(f"{r.load_pct:+.1f} %")
+            self.values["pos"].setText(f"{r.position} ({r.position * state.model.deg_per_step:.1f}°)")
+            current = "" if r.current_ma is None else f" · {r.current_ma:+.0f} mA"
+            self.values["load"].setText(f"{r.load_pct:+.1f} %{current}")
             self.values["volt"].setText(f"{r.voltage:.1f} V")
             self.values["temp"].setText(f"{r.temperature} °C")
         self.values["target"].setText(f"{state.target:.0f}" if armed and state.target is not None else "-")
@@ -193,3 +200,18 @@ class JointPanel(QGroupBox):
             notes.append("Outside configured travel: move it back by hand before arming")
         notes.extend(state.warnings)
         self.note.setText("\n".join(f"▲ {n}" for n in notes))
+
+    def _show_offline(self, state: JointState) -> None:
+        self._armed = False
+        self._slider_enabled = False
+        self.slider.setEnabled(False)
+        self.torque_button.setEnabled(False)
+        self.torque_button.setText("Offline")
+        self.torque_button.setStyleSheet("")
+        self.chip.setText("◌ OFFLINE")
+        self.chip.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-weight: 700;")
+        self.bar.set_values(None, None)
+        self.travel.setText(f"travel {self.lo}–{self.hi} · {state.model.label} steps")
+        for value in self.values.values():
+            value.setText("-")
+        self.note.setText("◌ No reply at startup - connect the servo and press Rescan bus")

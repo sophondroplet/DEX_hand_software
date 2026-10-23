@@ -48,6 +48,7 @@ class TraceRecorder:
     goals: dict[int, float]
     names: dict[int, str]
     tolerance: float = 3.0
+    tolerances: dict[int, float] = field(default_factory=dict)  # per joint (own step units); else `tolerance`
     rows: list[TraceRow] = field(default_factory=list)
     plan_end: float | None = None  # clock time the plan finished (tail recording continues)
     stopped: bool = False
@@ -68,10 +69,11 @@ class TraceRecorder:
         for servo_id, goal in self.goals.items():
             rows = [r for r in self.rows if r.servo_id == servo_id]
             positions = [(r.t, r.position) for r in rows if r.position is not None]
+            tolerance = self.tolerances.get(servo_id, self.tolerance)
             # Arrival = first sample after the last one outside tolerance (and the joint ends inside it).
             arrival = None
-            if positions and abs(positions[-1][1] - goal) <= self.tolerance:
-                last_out = max((i for i, (_, p) in enumerate(positions) if abs(p - goal) > self.tolerance),
+            if positions and abs(positions[-1][1] - goal) <= tolerance:
+                last_out = max((i for i, (_, p) in enumerate(positions) if abs(p - goal) > tolerance),
                                default=-1)
                 arrival = positions[last_out + 1][0]
             previous_setpoint = None

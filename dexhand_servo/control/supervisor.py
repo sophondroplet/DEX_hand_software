@@ -26,6 +26,7 @@ class JointInput:
     # Single-write move in flight: the servo paces itself and `sent_setpoint` is the final goal, so lag
     # behind it is expected. Tracking-error, stall and parked-under-load checks pause until it ends.
     free_running: bool = False
+    current_cap_ma: float | None = None  # armed HLS joints: goal-current cap (stall current) in mA
 
 
 @dataclass(frozen=True)
@@ -49,8 +50,11 @@ class SupervisorResult:
 
 
 class Supervisor:
-    def __init__(self, motion: MotionConfig) -> None:
+    """`scales`: native steps per SCS0009 step per joint (step thresholds in MotionConfig are SCS0009 steps)."""
+
+    def __init__(self, motion: MotionConfig, scales: Mapping[int, float] | None = None) -> None:
         self.cfg = motion
+        self._scales = dict(scales or {})
         self._since: dict[tuple, float] = {}
         self._history: dict[int, deque[tuple[float, float, int]]] = {}
         self._last_setpoint: dict[int, float] = {}
@@ -109,6 +113,7 @@ class Supervisor:
     def _check_joint(self, now: float, servo_id: int, j: JointInput, r: ServoReading, out: SupervisorResult) -> None:
         cfg = self.cfg
         key = lambda name: (name, servo_id)
+        scale = self._scales.get(servo_id, 1.0)
 
         # Torque state must match what the worker believes.
         if j.armed and r.torque == 0:
@@ -133,6 +138,13 @@ class Supervisor:
         elif load >= cfg.load_warn_pct:
             out.warn(servo_id, f"load {load:.0f}%")
 
+        if r.current_ma is not None and j.current_cap_ma is not None:
+            limit = cfg.current_trip_frac * j.current_cap_ma
+            at_cap = j.armed and abs(r.current_ma) >= limit
+            if self._held(key("current"), at_cap, now, cfg.current_trip_s):
+                out.trips.append(Trip("joint", servo_id, f"ID {servo_id} current {abs(r.current_ma):.0f} mA at its "
+                                                         f"{j.current_cap_ma:.0f} mA cap (stalled?)"))
+
         hot = self._held(key("temp"), j.armed and r.temperature >= cfg.temperature_trip_c, now,
                          cfg.temperature_trip_s)
         if hot:
@@ -147,7 +159,7 @@ class Supervisor:
                 self._since.pop(key(name), None)
             return
 
-        mismatch = abs(r.goal - round(j.sent_setpoint)) > cfg.goal_mismatch_steps
+        mismatch = abs(r.goal - round(j.sent_setpoint)) > cfg.goal_mismatch_steps * scale
         if self._held(key("goal"), mismatch, now, cfg.goal_mismatch_s):
             out.trips.append(Trip("joint", servo_id, f"ID {servo_id} goal register {r.goal} does not follow "
                                                      f"the sent setpoint {j.sent_setpoint:.0f}"))
@@ -165,7 +177,7 @@ class Supervisor:
         self._last_setpoint[servo_id] = j.sent_setpoint
         static = previous is not None and abs(j.sent_setpoint - previous) < 0.5
         short = r.position - j.sent_setpoint
-        parked = (static and load >= cfg.hold_load_warn_pct and abs(short) >= cfg.hold_error_steps)
+        parked = (static and load >= cfg.hold_load_warn_pct and abs(short) >= cfg.hold_error_steps * scale)
         if self._held(key("hold"), parked, now, cfg.hold_warn_s):
             held_for = now - self._since[key("hold")]
             text = (f"holding {load:.0f}% load {short:+.0f} steps from its target for {held_for:.0f} s - "
@@ -174,7 +186,7 @@ class Supervisor:
             out.warn(servo_id, text)
 
         error = abs(r.position - j.sent_setpoint)
-        if self._held(key("track"), error > cfg.tracking_error_steps, now, cfg.tracking_error_s):
+        if self._held(key("track"), error > cfg.tracking_error_steps * scale, now, cfg.tracking_error_s):
             out.trips.append(Trip("joint", servo_id, f"ID {servo_id} tracking error {error:.0f} steps"))
 
         history = self._history.setdefault(servo_id, deque())
@@ -185,6 +197,6 @@ class Supervisor:
             _, sp0, pos0 = history[0]
             commanded = abs(j.sent_setpoint - sp0)
             moved = abs(r.position - pos0)
-            if (commanded > 2 * cfg.stall_min_motion_steps and moved < cfg.stall_min_motion_steps
+            if (commanded > 2 * cfg.stall_min_motion_steps * scale and moved < cfg.stall_min_motion_steps * scale
                     and load > cfg.stall_load_pct):
                 out.trips.append(Trip("joint", servo_id, f"ID {servo_id} stalled under {load:.0f}% load"))

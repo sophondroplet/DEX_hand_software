@@ -1,7 +1,7 @@
 [project]
 name = "dexhand-servo-bringup"
 version = "0.1.0"
-description = "Read-only-first bring-up and diagnostics for the Nimo Dexhand SCS0009 servo bus (FE-URT-2)"
+description = "Read-only-first bring-up, diagnostics and control for the Nimo Dexhand SCS0009 / HLS3606 servo bus (FE-URT-2)"
 requires-python = ">=3.12"
 dependencies = [
     "ftservo-python-sdk==2.0.1",

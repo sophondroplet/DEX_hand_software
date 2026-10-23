@@ -20,21 +20,29 @@ Checks:
      long move on its own: start latency, whether it ramps up (acceleration) or jumps to
      full speed, steady speed vs register, overshoot and settling time.
 Speed 0 and goal-time moves are never sent (the motion policy refuses them).
+
+Amplitudes, step counts and speed registers given on the command line are in SCS0009 units
+(~0.293 deg per step, register ~steps/s) and are converted to the joint's servo model, so the
+same command moves an HLS3606 joint by the same angle at the same angular speed. Positions,
+measured speeds and the suggested max_speed in the report are in the joint's own steps.
 """
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any
 
 from .config import JointConfig, MotionConfig
-from .control.arming import arm_joint, disarm_joint, read_status
-from .control.policy import REG_GOAL_BLOCK, MotionPolicy, goal_block, limits_from_config
+from .control.arming import arm_joint, disarm_joint, read_status, verify_identity
+from .control.policy import REG_GOAL_BLOCK, MotionPolicy, limits_from_config
 from .control.snapshot import ServoReading
 from .control.trace import TraceRecorder, TraceRow
+from .diagnostics import CensusError, ensure_census
+from .models import SCS0009, ServoModel
 from .registers import REG_TORQUE_ENABLE
 from .safe_bus import SafeBus
 
@@ -68,21 +76,23 @@ class Sample:
     torque: int
     goal: int
     status: int
+    current_ma: float | None = None
 
 
-def _sample(bus: SafeBus, servo_id: int, t0: float) -> Sample | None:
-    r = read_status(bus, servo_id)
+def _sample(bus: SafeBus, servo_id: int, t0: float, model: ServoModel = SCS0009) -> Sample | None:
+    r = read_status(bus, servo_id, model)
     if r is None:
         return None
-    return Sample(round(time.perf_counter() - t0, 4), r.position, r.load_pct, r.torque, r.goal, r.status)
+    return Sample(round(time.perf_counter() - t0, 4), r.position, r.load_pct, r.torque, r.goal, r.status,
+                  r.current_ma)
 
 
 def _watch(bus: SafeBus, servo_id: int, seconds: float, until: Callable[[Sample], bool] | None = None,
-           interval: float = 0.005, t0: float | None = None) -> list[Sample]:
+           interval: float = 0.005, t0: float | None = None, model: ServoModel = SCS0009) -> list[Sample]:
     t0 = time.perf_counter() if t0 is None else t0
     samples: list[Sample] = []
     while time.perf_counter() - t0 < seconds:
-        s = _sample(bus, servo_id, t0)
+        s = _sample(bus, servo_id, t0, model)
         if s is not None:
             samples.append(s)
             if until is not None and until(s):
@@ -92,7 +102,9 @@ def _watch(bus: SafeBus, servo_id: int, seconds: float, until: Callable[[Sample]
     return samples
 
 
-def analyse_single_move(samples: list[Sample], origin: int, target: int, register: int) -> dict[str, Any]:
+def analyse_single_move(
+    samples: list[Sample], origin: int, target: int, register: int, model: ServoModel = SCS0009
+) -> dict[str, Any]:
     """Profile of one servo-executed move; times are relative to the goal write."""
     direction = 1 if target >= origin else -1
     span = abs(target - origin)
@@ -100,7 +112,7 @@ def analyse_single_move(samples: list[Sample], origin: int, target: int, registe
     if len(samples) < 3 or span == 0:
         return out
     progress = [(s.t, (s.position - origin) * direction) for s in samples]
-    started = next((t for t, d in progress if d >= 2), None)
+    started = next((t for t, d in progress if d >= model.scs_steps(2)), None)
     out["latency_ms"] = None if started is None else round(started * 1000, 1)
     # Velocity by central difference over ~10 ms (two pointers, linear time), robust to the
     # 1-step position quantisation. Entries: (t, displacement, velocity).
@@ -117,14 +129,14 @@ def analyse_single_move(samples: list[Sample], origin: int, target: int, registe
     middle = [v for _, d, v in velocity if 0.3 * span <= d <= 0.7 * span]
     steady = sorted(middle)[len(middle) // 2] if middle else None
     out["steady_steps_per_s"] = None if steady is None else round(steady, 1)
-    out["steady_vs_register"] = None if not steady else round(steady / register, 2)
+    out["steady_vs_register"] = None if not steady else round(steady / model.steps_per_s(register), 2)
     if steady and started is not None:
         reached_90 = next((t for t, _, v in velocity if t >= started and v >= 0.9 * steady), None)
         ramp = None if reached_90 is None else max(0.0, reached_90 - started)
         out["ramp_ms"] = None if ramp is None else round(ramp * 1000, 1)
         out["approx_acceleration"] = None if not ramp else round(0.9 * steady / ramp)
     out["overshoot_steps"] = max(0, max(d for _, d in progress) - span)
-    inside = [abs(d - span) <= 1 for _, d in progress]
+    inside = [abs(d - span) <= model.scs_steps(1) for _, d in progress]
     settle_index = next((i for i in range(len(inside)) if all(inside[i:])), None)
     out["reached"] = settle_index is not None
     out["settle_ms"] = None if settle_index is None else round(progress[settle_index][0] * 1000, 1)
@@ -170,12 +182,38 @@ def run_verify_motion(
     if not joint.has_travel_limits:
         raise VerifyAborted(f"ID {servo_id} has no travel limits in config.py")
     assert joint.min_position is not None and joint.max_position is not None
-    # No per-packet jump limit here: the test moves are single small goals (<= 40 steps) by design.
-    policy = MotionPolicy(limits_from_config({servo_id: joint}, motion, step_guard=False), known_ids=[servo_id])
+    try:
+        ensure_census(bus)
+    except CensusError as exc:
+        raise VerifyAborted(f"bus census failed: {exc}") from exc
+    identity, problem = verify_identity(bus, servo_id, joint)
+    if identity is None:
+        raise VerifyAborted(problem)
+    model = identity.model
+    # Command-line values are SCS0009 units: the same angles and angular speeds on every model.
+    amplitude, single_write_steps = model.scs_steps(amplitude), model.scs_steps(single_write_steps)
+    margin, near, moved = model.scs_steps(5), model.scs_steps(1), model.scs_steps(2)
+    to_register = lambda value: model.speed_register(model.native_speed(value))  # noqa: E731
+    speed_sweep = tuple(sorted({to_register(r) for r in speed_sweep}))
+    single_write = tuple(sorted({to_register(r) for r in single_write}))
+    # No per-packet jump limit here: the test moves are single small goals (<= 40 SCS0009 steps) by design.
+    limits = limits_from_config({servo_id: joint}, motion, step_guard=False)[servo_id]
+    # The operator asked for these registers explicitly; the HLS speed loop paces each small test move.
+    limits = replace(limits, speed_cap=max([limits.speed_cap, *speed_sweep, *single_write]))
+    policy = MotionPolicy({servo_id: limits}, known_ids=[servo_id])
     bus.set_policy(policy)
-    cap = policy.limits[servo_id].speed_cap
-    speed = min(speed, cap)
+    cap = limits.speed_cap
+    speed = min(to_register(speed), cap)
     report = VerifyReport(servo_id, joint.name)
+
+    def status(what: str) -> ServoReading:
+        return _require(read_status(bus, servo_id, model), what)
+
+    def watch(seconds: float, until: Callable[[Sample], bool] | None = None, **kwargs: Any) -> list[Sample]:
+        return _watch(bus, servo_id, seconds, until, model=model, **kwargs)
+
+    def goal(position: int, register: int) -> bytes:
+        return policy.encode_goal(servo_id, position, register)
 
     def confirm(text: str) -> None:
         if ask(f"{text} [y/N] (type y + Enter; Enter alone = no) ").strip().lower() not in ("y", "yes"):
@@ -185,38 +223,38 @@ def run_verify_motion(
         return disarm_joint(bus, policy, servo_id)
 
     try:
-        start = _require(read_status(bus, servo_id), "pre-check")
+        start = status("pre-check")
         if start.torque:
             say("Torque was on; switching it off first.")
             torque_off()
-            start = _require(read_status(bus, servo_id), "pre-check")
-        lo, hi = joint.min_position + amplitude + 5, joint.max_position - amplitude - 5
+            start = status("pre-check")
+        lo, hi = joint.min_position + amplitude + margin, joint.max_position - amplitude - margin
         if not lo <= start.position <= hi:
             raise VerifyAborted(
                 f"position {start.position} too close to the travel ends; move the joint by hand into [{lo}, {hi}]"
             )
         report.results["start"] = {"position": start.position, "goal": start.goal, "voltage": start.voltage}
-        say(f"ID {servo_id} ({joint.name}) at {start.position}, travel [{joint.min_position}, "
+        say(f"ID {servo_id} ({joint.name}, {model.label}) at {start.position}, travel [{joint.min_position}, "
             f"{joint.max_position}], moves of +-{amplitude} steps at speed register {speed} (cap {cap}).")
         confirm("Hand clear, power cut-off within reach. Start?")
 
         # A: implicit torque on goal write.
-        policy.add_armed(servo_id)
-        bus.write_block(servo_id, REG_GOAL_BLOCK, goal_block(start.position, speed))
-        after = _require(read_status(bus, servo_id), "test A")
+        policy.add_armed(servo_id, identity)
+        bus.write_block(servo_id, REG_GOAL_BLOCK, goal(start.position, speed))
+        after = status("test A")
         report.results["A_goal_write_enables_torque"] = bool(after.torque)
         say(f"A. goal write with torque off -> torque {'ON (implicit)' if after.torque else 'stays off'}")
         torque_off()
 
         # B: torque-on alone holds?
-        before = _require(read_status(bus, servo_id), "test B")
-        if abs(before.goal - before.position) > motion.arm_hold_tolerance:
+        before = status("test B")
+        if abs(before.goal - before.position) > model.scs_steps(motion.arm_hold_tolerance):
             report.results["B_torque_only_hold"] = "skipped: goal register does not mirror position"
             say("B. skipped (goal register does not mirror the position)")
         else:
-            policy.add_armed(servo_id)
+            policy.add_armed(servo_id, identity)
             bus.write_byte(servo_id, REG_TORQUE_ENABLE, 1)
-            samples = _watch(bus, servo_id, 0.5)
+            samples = watch(0.5)
             drift = max((abs(s.position - before.position) for s in samples), default=None)
             report.results["B_torque_only_hold"] = {"max_drift_steps": drift, "samples": len(samples)}
             say(f"B. torque on without a goal write: max drift {drift} steps")
@@ -231,14 +269,15 @@ def run_verify_motion(
         moves = []
         for direction in (+1, -1):
             target = base + direction * amplitude if direction > 0 else base
-            origin = _require(read_status(bus, servo_id), "test C").position
-            bus.write_block(servo_id, REG_GOAL_BLOCK, goal_block(target, speed))
-            samples = _watch(bus, servo_id, 3.0, until=lambda s, g=target: abs(s.position - g) <= 1)
-            moving = [s for s in samples if abs(s.position - origin) >= 2 and abs(s.position - target) >= 2]
+            origin = status("test C").position
+            bus.write_block(servo_id, REG_GOAL_BLOCK, goal(target, speed))
+            samples = watch(3.0, until=lambda s, g=target: abs(s.position - g) <= near)
+            moving = [s for s in samples if abs(s.position - origin) >= moved and abs(s.position - target) >= moved]
             measured = _rate(samples, origin, target)
             loads = [s.load for s in moving]
             moves.append({
-                "from": origin, "to": target, "reached": bool(samples) and abs(samples[-1].position - target) <= 1,
+                "from": origin, "to": target,
+                "reached": bool(samples) and abs(samples[-1].position - target) <= near,
                 "measured_steps_per_s": None if measured is None else round(measured, 1),
                 "mean_load_pct": round(sum(loads) / len(loads), 1) if loads else None,
             })
@@ -255,14 +294,14 @@ def run_verify_motion(
         # D: SYNC_WRITE.
         confirm(f"D. Move +{amplitude // 2} and back using SYNC_WRITE, then SYNC_WRITE torque off?")
         mid = base + amplitude // 2
-        bus.sync_write(REG_GOAL_BLOCK, 6, {servo_id: goal_block(mid, speed)})
-        samples = _watch(bus, servo_id, 3.0, until=lambda s: abs(s.position - mid) <= 1)
-        reached = bool(samples) and abs(samples[-1].position - mid) <= 1
-        bus.sync_write(REG_GOAL_BLOCK, 6, {servo_id: goal_block(base, speed)})
-        _watch(bus, servo_id, 3.0, until=lambda s: abs(s.position - base) <= 1)
+        bus.sync_write(REG_GOAL_BLOCK, 6, {servo_id: goal(mid, speed)})
+        samples = watch(3.0, until=lambda s: abs(s.position - mid) <= near)
+        reached = bool(samples) and abs(samples[-1].position - mid) <= near
+        bus.sync_write(REG_GOAL_BLOCK, 6, {servo_id: goal(base, speed)})
+        watch(3.0, until=lambda s: abs(s.position - base) <= near)
         policy.remove_armed(servo_id)
         bus.sync_write(REG_TORQUE_ENABLE, 1, {servo_id: b"\x00"})
-        off = _require(read_status(bus, servo_id), "test D")
+        off = status("test D")
         report.results["D_sync_write_goal"] = reached
         report.results["D_sync_write_torque_off"] = off.torque == 0
         say(f"D. SYNC_WRITE goal {'OK' if reached else 'NOT reached'}; "
@@ -280,11 +319,11 @@ def run_verify_motion(
             for register in registers:
                 entry: dict[str, Any] = {"register": register}
                 for key, target in (("plus", base + amplitude), ("minus", base)):
-                    origin = _require(read_status(bus, servo_id), "test F").position
-                    bus.write_block(servo_id, REG_GOAL_BLOCK, goal_block(target, register))
-                    samples = _watch(bus, servo_id, 3.0, until=lambda s, g=target: abs(s.position - g) <= 1)
+                    origin = status("test F").position
+                    bus.write_block(servo_id, REG_GOAL_BLOCK, goal(target, register))
+                    samples = watch(3.0, until=lambda s, g=target: abs(s.position - g) <= near)
                     entry[f"{key}_steps_per_s"] = _rate(samples, origin, target)
-                    entry[f"{key}_reached"] = bool(samples) and abs(samples[-1].position - target) <= 1
+                    entry[f"{key}_reached"] = bool(samples) and abs(samples[-1].position - target) <= near
                     entry[f"{key}_max_load_pct"] = max((abs(s.load) for s in samples), default=None)
                     time.sleep(0.2)
                 sweep.append(entry)
@@ -296,7 +335,9 @@ def run_verify_motion(
             # proportional-only position loop); its creep rate is not a speed limit and must not become
             # max_speed, or every synchronised move of the hand slows to that crawl.
             reached = top["plus_reached"] and top["minus_reached"]
-            recommended = max(10, min(1000, int(0.7 * min(rates)))) if reached and len(rates) == 2 else None
+            ceiling = math.floor(model.steps_per_s(model.max_speed_register))
+            recommended = (max(model.scs_steps(10), min(ceiling, int(0.7 * min(rates))))
+                           if reached and len(rates) == 2 else None)
             report.results["F_speed_sweep"] = sweep
             report.results["F_recommended_max_speed"] = recommended
             report.results["F_force_limited"] = not reached
@@ -314,8 +355,8 @@ def run_verify_motion(
         # G: optional single-write long moves.
         if single_write:
             steps = single_write_steps
-            now_at = _require(read_status(bus, servo_id), "test G").position
-            lo_g, hi_g = joint.min_position + 5, joint.max_position - steps - 5
+            now_at = status("test G").position
+            lo_g, hi_g = joint.min_position + margin, joint.max_position - steps - margin
             if not lo_g <= now_at <= hi_g:
                 report.results["G_single_write"] = f"skipped: position {now_at} not within [{lo_g}, {hi_g}]"
                 say(f"G. skipped: needs the joint within [{lo_g}, {hi_g}] (it is at {now_at})")
@@ -328,19 +369,19 @@ def run_verify_motion(
                 moves = []
                 for register in sorted(single_write):
                     for target in (base + steps, base):
-                        origin = _require(read_status(bus, servo_id), "test G").position
+                        origin = status("test G").position
                         t_cmd = time.perf_counter()
-                        bus.write_block(servo_id, REG_GOAL_BLOCK, goal_block(target, register))
+                        bus.write_block(servo_id, REG_GOAL_BLOCK, goal(target, register))
                         settled: list[float] = []
 
                         def done(s: Sample, g: int = target) -> bool:
                             # stop 0.3 s after first reaching the goal, to see overshoot and settling
-                            if abs(s.position - g) <= 1 and not settled:
+                            if abs(s.position - g) <= near and not settled:
                                 settled.append(s.t)
                             return bool(settled) and s.t - settled[0] >= 0.3
 
-                        samples = _watch(bus, servo_id, 4.0, until=done, interval=0.0, t0=t_cmd)
-                        move = analyse_single_move(samples, origin, target, register)
+                        samples = watch(4.0, until=done, interval=0.0, t0=t_cmd)
+                        move = analyse_single_move(samples, origin, target, register, model)
                         moves.append(move)
                         say(f"G. reg {register:4d} {origin}->{target}: latency {move.get('latency_ms')} ms, "
                             f"ramp {move.get('ramp_ms')} ms, steady {move.get('steady_steps_per_s')} steps/s "
@@ -357,11 +398,15 @@ def run_verify_motion(
             if not armed.ok or armed.reading is None:
                 raise VerifyAborted(f"arming failed: {armed.reason}")
             push = armed.reading.position + amplitude
-            bus.write_block(servo_id, REG_GOAL_BLOCK, goal_block(push, speed))
-            samples = _watch(bus, servo_id, 2.5, until=lambda s: s.torque == 0)
+            bus.write_block(servo_id, REG_GOAL_BLOCK, goal(push, speed))
+            samples = watch(2.5, until=lambda s: s.torque == 0)
             torque_off()
+            currents = [abs(s.current_ma) for s in samples if s.current_ma is not None]
             report.results["E_overload"] = {
                 "max_load_pct": max((abs(s.load) for s in samples), default=None),
+                "max_current_ma": max(currents, default=None),
+                "current_cap_ma": (None if identity.current_cap is None
+                                   else identity.current_cap * (model.current_ma_per_unit or 0)),
                 "servo_released_torque": any(s.torque == 0 for s in samples),
                 "released_after_s": next((s.t for s in samples if s.torque == 0), None),
                 "status_values": sorted({s.status for s in samples}),

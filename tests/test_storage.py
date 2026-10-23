@@ -66,3 +66,19 @@ def test_helpers() -> None:
     assert builtin_poses(JOINTS) == {"center": {1: 500, 2: 500}}
     with pytest.raises(StorageError):
         safe_file_stem("握拳")
+
+
+def test_files_from_another_servo_model_are_refused(tmp_path) -> None:
+    lib = PoseLibrary(tmp_path / "poses.json", JOINTS)
+    lib.save("open", {1: 400})
+    assert json.loads((tmp_path / "poses.json").read_text(encoding="utf-8"))["models"] == {"1": "scs0009",
+                                                                                         "2": "scs0009"}
+    remotored = {1: JointConfig("a", 300, 3000, model="hls3606"), 2: JOINTS[2]}
+    with pytest.raises(StorageError, match="servo model"):
+        PoseLibrary(tmp_path / "poses.json", remotored).load()
+    data = json.loads((tmp_path / "poses.json").read_text(encoding="utf-8"))
+    del data["models"]  # files written before models were recorded count as SCS0009
+    (tmp_path / "poses.json").write_text(json.dumps(data), encoding="utf-8")
+    assert PoseLibrary(tmp_path / "poses.json", JOINTS).load() == {"open": {1: 400}}
+    with pytest.raises(StorageError, match="servo model"):
+        PoseLibrary(tmp_path / "poses.json", remotored).load()

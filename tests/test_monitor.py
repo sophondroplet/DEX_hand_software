@@ -91,3 +91,21 @@ def test_cli_monitor_end_to_end(open_bus, monkeypatch, tmp_path) -> None:
     assert len(list(tmp_path.glob("monitor_*.csv"))) == 1
     assert len(list(tmp_path.glob("monitor_*.html"))) == 1
     assert set(fake.instructions) == {0x02}
+
+
+def test_mixed_models_are_decoded_per_servo(open_bus, tmp_path) -> None:
+    from dexhand_servo.models import HLS3606, SCS0009
+
+    hls = FakeServo(3, position=2500, position_noise=0, model=HLS3606, load_pct=10.0)
+    fake = FakeBus([FakeServo(1, position=400, position_noise=0), hls])
+    result = run_monitor(open_bus(fake), (1, 3), rate_hz=200, duration_s=0.05)
+    assert result.models == {1: SCS0009, 3: HLS3606}
+    assert {s.position for s in result.series[1]} == {400}
+    assert {s.position for s in result.series[3]} == {2500}
+    assert all(s.current_ma is None for s in result.series[1])
+    assert all(s.current_ma is not None for s in result.series[3])
+    stats = compute_stats(3, result.series[3], 5, HLS3606)
+    assert stats.jump_threshold == 17 and stats.deg_per_step == HLS3606.deg_per_step
+    rows = list(csv.DictReader(write_csv(result, tmp_path / "m.csv").open(encoding="utf-8")))
+    assert {r["model"] for r in rows} == {"scs0009", "hls3606"}
+    assert set(fake.instructions) == {0x02}

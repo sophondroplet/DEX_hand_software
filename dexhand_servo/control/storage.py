@@ -1,9 +1,10 @@
 """Poses and teach recordings as JSON under `data/`.
 
-Every file stores the ID -> joint-name map it was made with. Loading refuses a
-file whose map disagrees with the current `JOINTS`, or whose positions fall
-outside the current travel limits - so a re-wired or re-measured hand never
-replays stale positions.
+Every file stores the ID -> joint-name map and the ID -> servo-model map it was made
+with. Loading refuses a file whose maps disagree with the current `JOINTS` (files
+written before models were recorded count as SCS0009), or whose positions fall outside
+the current travel limits - so a re-wired, re-measured or re-motored hand never replays
+stale positions (positions are raw steps of the servo model they were recorded on).
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config import JointConfig
+from ..models import SCS0009
 from .trajectory import Keyframe
 
 SCHEMA_VERSION = 1
@@ -39,6 +41,10 @@ def _joint_map(joints: Mapping[int, JointConfig]) -> dict[str, str]:
     return {str(servo_id): joint.name for servo_id, joint in joints.items()}
 
 
+def _model_map(joints: Mapping[int, JointConfig]) -> dict[str, str]:
+    return {str(servo_id): joint.model for servo_id, joint in joints.items()}
+
+
 def _check_positions(positions: Mapping[int, int], joints: Mapping[int, JointConfig], where: str) -> None:
     for servo_id, value in positions.items():
         joint = joints.get(servo_id)
@@ -60,6 +66,13 @@ def _check_header(data: dict[str, Any], joints: Mapping[int, JointConfig], where
     if mismatched:
         raise StorageError(f"{where}: joint map differs from config for IDs {mismatched} "
                            "(hand re-wired or renamed?)")
+    stored_models = data.get("models", {})
+    current_models = _model_map(joints)
+    changed = sorted(k for k in stored
+                     if k in current_models and stored_models.get(k, SCS0009.key) != current_models[k])
+    if changed:
+        raise StorageError(f"{where}: servo model differs from config for IDs {changed} "
+                           "(positions were recorded in another servo's steps)")
 
 
 def builtin_poses(joints: Mapping[int, JointConfig]) -> dict[str, dict[int, int]]:
@@ -111,6 +124,7 @@ class PoseLibrary:
         data = {
             "schema_version": SCHEMA_VERSION,
             "joints": _joint_map(self.joints),
+            "models": _model_map(self.joints),
             "poses": {name: {str(k): v for k, v in sorted(p.items())} for name, p in sorted(poses.items())},
         }
         self.path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -130,6 +144,7 @@ def save_recording(
         "name": name,
         "created": datetime.now().isoformat(timespec="seconds"),
         "joints": _joint_map(joints),
+        "models": _model_map(joints),
         "keyframes": [{"t": kf.t, "positions": {str(k): v for k, v in kf.positions.items()}} for kf in keyframes],
     }
     path.write_text(json.dumps(data, indent=1, ensure_ascii=False), encoding="utf-8")

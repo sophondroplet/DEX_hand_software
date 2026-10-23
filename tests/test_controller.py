@@ -34,6 +34,7 @@ def rig(clock):
     fake = FakeBus([FakeServo(1, position=500, position_noise=0), FakeServo(2, position=450, position_noise=0)],
                    clock=clock)
     bus = SafeBus("/dev/fake", 1_000_000, latency_ms=2, serial_factory=fake.serial_factory)
+    bus.census = {}  # census taken: no HLS secondary IDs
     bus.open()
     ctrl = Controller(bus, JOINTS, MOTION, clock=clock)
     ctrl.startup()
@@ -59,6 +60,7 @@ def messages(ctrl):
 def test_startup_turns_torque_off(clock) -> None:
     fake = FakeBus([FakeServo(1, position=500, torque_enable=1)], clock=clock)
     bus = SafeBus("/dev/fake", 1_000_000, latency_ms=2, serial_factory=fake.serial_factory)
+    bus.census = {}  # census taken: no HLS secondary IDs
     bus.open()
     ctrl = Controller(bus, {1: JOINTS[1]}, MOTION, clock=clock)
     assert ctrl.startup()
@@ -68,6 +70,7 @@ def test_startup_turns_torque_off(clock) -> None:
 def test_arm_refused_outside_travel_without_any_goal_write(clock) -> None:
     fake = FakeBus([FakeServo(1, position=250, position_noise=0)], clock=clock)
     bus = SafeBus("/dev/fake", 1_000_000, latency_ms=2, serial_factory=fake.serial_factory)
+    bus.census = {}  # census taken: no HLS secondary IDs
     bus.open()
     ctrl = Controller(bus, {1: JOINTS[1]}, MOTION, clock=clock)
     ctrl.startup()
@@ -249,6 +252,7 @@ def test_recording_refused_while_armed(rig) -> None:
 def test_gui_heartbeat_watchdog(clock) -> None:
     fake = FakeBus([FakeServo(1, position=500, position_noise=0)], clock=clock)
     bus = SafeBus("/dev/fake", 1_000_000, latency_ms=2, serial_factory=fake.serial_factory)
+    bus.census = {}  # census taken: no HLS secondary IDs
     bus.open()
     ctrl = Controller(bus, {1: JOINTS[1]}, replace(MOTION, heartbeat_freeze_s=0.5, heartbeat_trip_s=2.0), clock=clock)
     ctrl.startup()
@@ -263,6 +267,7 @@ def test_gui_heartbeat_watchdog(clock) -> None:
 def test_worker_thread_lifecycle() -> None:
     fake = FakeBus([FakeServo(1, position=500)])
     bus = SafeBus("/dev/fake", 1_000_000, latency_ms=2, serial_factory=fake.serial_factory)
+    bus.census = {}  # census taken: no HLS secondary IDs
     bus.open()
     ctrl = Controller(bus, {1: JOINTS[1]}, MOTION)
     ctrl.start()
@@ -298,6 +303,7 @@ def test_pose_move_streams_at_full_register_and_writes_a_trace(clock, tmp_path) 
     fake = FakeBus([FakeServo(1, position=500, position_noise=0), FakeServo(2, position=450, position_noise=0)],
                    clock=clock)
     bus = SafeBus("/dev/fake", 1_000_000, latency_ms=2, serial_factory=fake.serial_factory)
+    bus.census = {}  # census taken: no HLS secondary IDs
     bus.open()
     ctrl = Controller(bus, JOINTS, replace(MOTION, stream_speed_mode="fixed"), clock=clock, trace_dir=tmp_path)
     ctrl.startup()
@@ -359,6 +365,7 @@ def test_dynamic_speed_register_follows_setpoint_velocity(rig) -> None:
 def test_unknown_stream_speed_mode_is_rejected(clock) -> None:
     fake = FakeBus([FakeServo(1)], clock=clock)
     bus = SafeBus("/dev/fake", 1_000_000, latency_ms=2, serial_factory=fake.serial_factory)
+    bus.census = {}  # census taken: no HLS secondary IDs
     with pytest.raises(ValueError, match="stream_speed_mode"):
         Controller(bus, {1: JOINTS[1]}, replace(MOTION, stream_speed_mode="turbo"), clock=clock)
 

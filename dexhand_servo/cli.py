@@ -87,11 +87,11 @@ def cmd_list_ports(_: argparse.Namespace) -> int:
         console.print("[yellow]No USB serial ports found.[/]")
         return 2
     table = Table(title="USB serial ports")
-    for column in ("Device", "Description", "VID:PID", "WCH"):
+    for column in ("Device", "Description", "VID:PID", "Kind"):
         table.add_column(column)
     for c in candidates:
         vid_pid = f"{c.vid:04X}:{c.pid:04X}" if c.vid is not None and c.pid is not None else "-"
-        table.add_row(c.device, c.description, vid_pid, "yes" if c.is_wch else "")
+        table.add_row(c.device, c.description, vid_pid, c.kind.value)
     console.print(table)
     return 0
 
@@ -140,7 +140,7 @@ def _monitor_table(result: MonitorResult, jump_threshold: int) -> Table:
                    "V", "Fail", "Trace (last 40)"):
         table.add_column(column, no_wrap=True)
     for servo_id, samples in result.series.items():
-        st = compute_stats(servo_id, samples, jump_threshold)
+        st = compute_stats(servo_id, samples, jump_threshold, result.models.get(servo_id))
         trace = [s.position for s in samples[-40:] if s.position is not None]
         spread = "-" if st.position_spread is None else f"{st.position_spread} ({st.spread_deg} deg)"
         volts = "-" if st.voltage_min is None else f"{st.voltage_min:.1f}-{st.voltage_max:.1f}"
@@ -180,7 +180,7 @@ def cmd_monitor(args: argparse.Namespace) -> int:
     finally:
         bus.close()
 
-    stats = {servo_id: compute_stats(servo_id, samples, args.jump_threshold)
+    stats = {servo_id: compute_stats(servo_id, samples, args.jump_threshold, result.models.get(servo_id))
              for servo_id, samples in result.series.items()}
     if result.overruns:
         console.print(f"[yellow]Requested {args.rate} Hz but achieved {result.achieved_rate_hz:.1f} Hz "
@@ -201,11 +201,11 @@ def _confirm_interactively(snapshot: dict[str, Any]) -> bool:
     table.add_column("Field")
     table.add_column("Value")
     for key, value in snapshot.items():
-        if key not in ("from_id", "to_id"):
+        if key not in ("from_id", "to_id", "lock_register"):
             table.add_row(key, str(value))
     console.print(table)
     console.print(
-        "[bold yellow]Only the registers ID (5) and EEPROM lock (48) will be written. "
+        f"[bold yellow]Only the registers ID (5) and EEPROM lock ({snapshot['lock_register']}) will be written. "
         "Make sure exactly ONE un-assigned servo's signal line is connected.[/]"
     )
     answer = console.input(f"Type the new ID [bold]{snapshot['to_id']}[/] to write it (anything else aborts): ")
@@ -250,7 +250,7 @@ def cmd_assign_id(args: argparse.Namespace) -> int:
 
 
 def cmd_verify_motion(args: argparse.Namespace) -> int:
-    from .verify_motion import run_verify_motion
+    from .verify_motion import VerifyAborted, run_verify_motion
 
     joint = JOINTS.get(args.id)
     if joint is None:
@@ -273,6 +273,9 @@ def cmd_verify_motion(args: argparse.Namespace) -> int:
             single_write=SINGLE_WRITE_REGISTERS if args.single_write else (),
             single_write_steps=args.single_write_steps,
         )
+    except VerifyAborted as exc:
+        console.print(f"[red bold]Aborted before any motion:[/] {exc}")
+        return 2
     finally:
         bus.close()
     path = write_json(report.to_dict(), args.report_dir, f"verify_motion_id{args.id}")
@@ -298,6 +301,7 @@ def cmd_verify_motion(args: argparse.Namespace) -> int:
 
 
 def cmd_tune_servo(args: argparse.Namespace) -> int:
+    from .diagnostics import read_identity
     from .tune_servo import TUNING_DIR, TuningAborted, load_original, read_tuning, restore_servo, tune_servo
 
     joint = JOINTS.get(args.id)
@@ -316,7 +320,9 @@ def cmd_tune_servo(args: argparse.Namespace) -> int:
                 console.print(f"[red]ID {args.id} does not reply cleanly[/]")
                 return 2
             values, torque = state
-            console.print(f"ID {args.id} ({name}): P gain {values.p_gain}, D gain {values.d_gain}, "
+            model, _ = read_identity(bus, args.id)
+            console.print(f"ID {args.id} ({name}, {model.label if model else 'unsupported model'}): "
+                          f"P gain {values.p_gain}, D gain {values.d_gain}, "
                           f"min start force {values.min_start}, torque {'ON' if torque else 'off'}")
             try:
                 original = load_original(TUNING_DIR, args.id)
@@ -341,6 +347,48 @@ def cmd_tune_servo(args: argparse.Namespace) -> int:
         return 0
     console.print("[red bold]Read-back does not match - check the servo and run --show.[/]")
     return 1
+
+
+def cmd_hls_setup(args: argparse.Namespace) -> int:
+    from .hls_setup import HlsSetupAborted, center_offset, restore_setup, show_setup, write_limits_from_config
+
+    joint = JOINTS.get(args.id)
+    bus = _open_bus(args)
+
+    def confirm(summary: str) -> bool:
+        console.print(summary, markup=False, highlight=False)
+        answer = console.input(f"Type the servo ID ({args.id}) to write (anything else aborts): ", markup=False)
+        return answer.strip() == str(args.id)
+
+    try:
+        if args.show:
+            setup = show_setup(bus, args.id)
+            mode = "multi-turn (limits 0/0)" if setup.multi_turn else f"limits {setup.min_angle}/{setup.max_angle}"
+            console.print(f"ID {args.id} ({joint.name if joint else '?'}): {mode}, position offset {setup.offset}, "
+                          f"mode {setup.mode}, torque {'ON' if setup.torque else 'off'}, position {setup.position}")
+            return 0
+        if args.center:
+            result = center_offset(bus, args.id, joint, confirm)
+        elif args.limits_from_config:
+            result = write_limits_from_config(bus, args.id, joint, confirm)
+        else:
+            result = restore_setup(bus, args.id, confirm)
+    except HlsSetupAborted as exc:
+        console.print(f"[red bold]Aborted, nothing written:[/] {exc}")
+        return 2
+    finally:
+        bus.close()
+    for step in result.steps:
+        console.print(f"  {step}", markup=False)
+    if not result.verified:
+        console.print("[red bold]Read-back does not match - check the servo and run --show.[/]")
+        return 1
+    next_step = f"`dexhand-servo diagnose --ids {args.id}`"
+    if args.center and result.after is not None:
+        next_step = (f"`dexhand-servo monitor --ids {args.id}` to measure the travel, and enter it in config.py "
+                     f"JOINTS with model=\"hls3606\", position_offset={result.after.offset}")
+    console.print(f"[green bold]Done.[/] Power-cycle the servo (required), then run {next_step}.")
+    return 0
 
 
 def cmd_gui(args: argparse.Namespace) -> int:
@@ -400,7 +448,8 @@ def build_parser() -> argparse.ArgumentParser:
     monitor.add_argument("--duration", type=non_negative_float, default=10.0,
                          help="seconds to run; 0 = until Ctrl-C (default 10)")
     monitor.add_argument("--jump-threshold", type=int, default=5,
-                         help="count sample-to-sample changes larger than this many steps (default 5)")
+                         help="count sample-to-sample changes larger than this many SCS0009 steps "
+                              "(~0.29 deg; scaled to the same angle on HLS servos; default 5)")
     monitor.add_argument("--no-report", action="store_true", help="skip writing CSV/HTML")
     monitor.set_defaults(func=cmd_monitor)
 
@@ -413,16 +462,19 @@ def build_parser() -> argparse.ArgumentParser:
     verify = sub.add_parser("verify-motion", help="MOVES one joint: checks firmware behaviour the GUI relies on")
     _add_link_args(verify)
     verify.add_argument("--id", type=int, required=True, help="servo ID to test")
-    verify.add_argument("--amplitude", type=int, default=20, help="test move size in steps (default 20, max 40)",
-                        choices=range(5, 41), metavar="5..40")
-    verify.add_argument("--speed", type=int, default=50, help="goal-speed register value for test moves")
+    verify.add_argument("--amplitude", type=int, default=20, choices=range(5, 41), metavar="5..40",
+                        help="test move size in SCS0009 steps (~0.29 deg; the same angle on HLS servos; "
+                             "default 20)")
+    verify.add_argument("--speed", type=int, default=50,
+                        help="speed of the test moves as an SCS0009 register (~steps/s; the same angular speed "
+                             "on HLS servos)")
     verify.add_argument("--speed-sweep", action="store_true",
                         help=f"measure actual speed at registers {SPEED_SWEEP_REGISTERS} and suggest max_speed")
     verify.add_argument("--single-write", action="store_true",
                         help=f"one goal write per direction at registers {SINGLE_WRITE_REGISTERS}: "
                              "how the servo executes a long move by itself")
     verify.add_argument("--single-write-steps", type=int, default=40, choices=range(10, 61), metavar="10..60",
-                        help="distance of the single-write moves (default 40)")
+                        help="distance of the single-write moves in SCS0009 steps (default 40)")
     verify.add_argument("--overload-test", action="store_true",
                         help="also test the servo's own overload cut-out (operator holds the finger)")
     verify.set_defaults(func=cmd_verify_motion)
@@ -430,11 +482,24 @@ def build_parser() -> argparse.ArgumentParser:
     tune = sub.add_parser("tune-servo", help="EEPROM: change P gain / minimum start force of one servo (torque off)")
     _add_link_args(tune)
     tune.add_argument("--id", type=int, required=True, help="servo ID")
-    tune.add_argument("--p-gain", type=int, help="position-loop P gain, register 21 (factory 15, allowed 5..60)")
-    tune.add_argument("--min-start", type=int, help="minimum start force, register 24 (factory 0, allowed 0..100)")
+    tune.add_argument("--p-gain", type=int, help="position-loop P gain, register 21 "
+                      "(SCS0009: factory 15, allowed 5..60; HLS3606: factory 32, allowed 16..64)")
+    tune.add_argument("--min-start", type=int, help="minimum start force, register 24 (allowed 0..100)")
     tune.add_argument("--restore", action="store_true", help="write back the values saved before the first change")
     tune.add_argument("--show", action="store_true", help="only read and print the current values")
     tune.set_defaults(func=cmd_tune_servo)
+
+    hls = sub.add_parser("hls-setup", help="EEPROM: single-turn setup of one HLS3606 (offset, angle limits)")
+    _add_link_args(hls)
+    hls.add_argument("--id", type=int, required=True, help="servo ID")
+    action = hls.add_mutually_exclusive_group(required=True)
+    action.add_argument("--show", action="store_true", help="only read and print limits, offset, mode, position")
+    action.add_argument("--center", action="store_true",
+                        help="write the position offset that puts the present position at 2048 (before measuring)")
+    action.add_argument("--limits-from-config", action="store_true",
+                        help="write the joint's config.py travel as the servo's EEPROM angle limits")
+    action.add_argument("--restore", action="store_true", help="write back the values saved before the first change")
+    hls.set_defaults(func=cmd_hls_setup)
 
     gui = sub.add_parser("gui", help="PySide6 control GUI (needs: uv sync --extra gui)")
     gui.add_argument("--port", help="serial device (auto-detected if omitted)")

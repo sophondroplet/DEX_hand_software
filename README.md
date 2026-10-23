@@ -1,8 +1,9 @@
 # Dexhand servo bus bring-up and control
 
-Bring-up, diagnostics and a PySide6 control GUI for the 8-DoF Dexhand prototype: 8 × Feetech
-SCS0009 on one TTL half-duplex bus, driven from macOS or Windows through a Feetech FE-URT-2 over
-USB.
+Bring-up, diagnostics and a PySide6 control GUI for the 8-DoF Dexhand prototype: Feetech
+SCS0009 and HLS3606 servos, mixed per servo ID on one TTL half-duplex bus, driven from macOS or
+Windows through a Feetech FE-URT-2 over USB, either directly or through an ESP32-S3 bridge (see
+*ESP32-S3 bridge*). See *Servo models* for what differs between the two servo models.
 
 The hand has **no mechanical end stops**. Every packet is checked twice against the active write
 policy, in [safe_bus.py](dexhand_servo/safe_bus.py):
@@ -15,28 +16,39 @@ A refused packet raises `UnsafeOperationError`, and nothing reaches the wire.
 | Command | Policy | What may be written |
 |---|---|---|
 | `diagnose`, `monitor` | read-only | nothing (PING / READ only) |
-| `assign-id` | id-assignment | one byte to register 5 (ID) or 48 (EEPROM lock) |
+| `assign-id` | id-assignment | one byte to register 5 (ID) or the model's EEPROM lock (48 SCS0009, 55 HLS3606) |
 | `verify-motion`, `gui` | motion ([control/policy.py](dexhand_servo/control/policy.py)) | see below |
-| `tune-servo` | servo-tuning ([tune_servo.py](dexhand_servo/tune_servo.py)) | one byte to register 21 (P gain, 5..60), 24 (min start force, 0..100) or 48 (lock); torque must be off |
+| `tune-servo` | servo-tuning ([tune_servo.py](dexhand_servo/tune_servo.py)) | one byte to register 21 (P gain; SCS0009 5..60, HLS3606 16..64), 24 (min start force, 0..100) or the model's lock, on one servo; torque must be off |
+| `hls-setup` | hls-setup ([hls_setup.py](dexhand_servo/hls_setup.py)) | HLS3606 only, one servo: angle limits 9/11 (one 4-byte WRITE), position offset 31, lock 55; torque must be off |
 
 The motion policy allows only:
 
 - **torque off**, for any configured ID;
 - **torque on**, for joints armed through the arming sequence;
 - **goal blocks**, single WRITE or SYNC_WRITE, under all of these conditions:
-  - the joint is armed;
+  - the joint is armed (which first verifies the servo against its `JointConfig`, see *Servo models*);
   - the position is inside that joint's configured travel;
-  - goal time is 0;
+  - SCS0009: goal time is 0; HLS3606: goal current (register 44) is 1..the cap verified at arming,
+    and no word has its sign bit set;
   - 1 ≤ speed ≤ the joint's speed cap;
   - in the GUI, the goal moves at most `max_speed × 0.1 s + 2` steps from the previously accepted
     goal (per-packet jump limit). The only exception is a single-write pose (see *Single-write
     poses*): the controller pre-authorises exactly that position and speed, the speed may not exceed
     the joint's `max_speed`, and the authorisation is used up by the one packet that carries it.
 
-  Speed 0 means "maximum speed" on SCS servos and is always refused.
+  Speed 0 means "maximum speed" on SCS servos ("stop" on the HLS) and is always refused.
 
 Everything else is refused: EEPROM writes, the lock register, REG_WRITE/ACTION, reset, and
-broadcast WRITE. A SYNC_WRITE with one bad entry is refused as a whole.
+broadcast WRITE. A SYNC_WRITE with one bad entry is refused as a whole. (The ESP32 bridge's link
+watchdog sends one packet of its own, a broadcast torque off; see *ESP32-S3 bridge*.)
+
+**Bus census.** An HLS3606 also acts on WRITE / SYNC_WRITE packets addressed to its *secondary* ID
+(register 7; factory default 0), which PING and READ cannot reveal. Before anything is written,
+every write command PINGs IDs 0–253 and reads registers 0–7 of each responder (about 1–5 s).
+Until that census succeeds, every write except torque-off is refused. After it, a write to an ID
+that is another servo's secondary ID is refused. Torque-off is always allowed, so an E-stop is never
+blocked. The census fails, and writes stay refused, if a responder cannot be read cleanly or is
+not a supported model.
 
 ## Setup
 
@@ -91,6 +103,55 @@ Serial ports: macOS uses `/dev/cu.*` (the tool maps `/dev/tty.*` to `cu.*` for y
   only thing preventing a joint from being driven past its mechanical range. Review changes to it
   as carefully as code changes, and say in the commit message how the limits were measured.
 
+## ESP32-S3 bridge
+
+Instead of the URT-2's own USB port, the PC can reach the bus through an ESP32-S3-DevKitC-1
+(N32R16V) running [firmware/urt_bridge](firmware/urt_bridge):
+
+```
+PC --USB (DevKit "USB" port)--> ESP32-S3 --UART1--> URT-2 TTL input --> servo bus
+```
+
+The bridge is transparent: bytes pass unchanged both ways, and the UART follows the baud rate the
+PC sets (only the rates in `SUPPORTED_BAUDRATES`), so every command, the guard, the census and the
+`diagnose` baud sweep work as before. `list-ports` shows it as `ESP32 bridge`. When both the bridge
+and the URT-2's USB port are plugged in, pass `--port`: the tool never guesses between them.
+
+**Wiring.** GPIO17 (TX) → URT-2 RX, GPIO18 (RX) ← URT-2 TX, GND ↔ GND. Set the URT-2 to take the
+bus from its TTL/MCU header instead of its USB chip (see the board's silkscreen / jumper). Check
+the URT-2's TTL level first: the ESP32 is a 3.3 V part, so a 5 V TX line from the URT-2 needs a
+divider before GPIO18. GPIO33–37 are used by the module's octal flash/PSRAM and cannot be used.
+
+**Power the ESP32 independently of the PC link** (DevKit "UART" port on a USB charger, or its 5V
+pin from a separate supply). If the PC's USB cable is its only supply, unplugging that cable
+switches the ESP32 off and the watchdog cannot act; the servos then keep holding their last goal.
+
+**Build and flash** ([PlatformIO](https://platformio.org/), from `firmware/urt_bridge`):
+
+```sh
+pio test -e native                                   # host unit tests, no hardware
+pio run -e esp32s3 -t upload --upload-port <DevKit "UART" port>
+pio device monitor -p <DevKit "UART" port>           # bridge log, 115200 baud
+```
+
+The log port is UART0; the PC tool uses the native "USB" port. The RGB LED pin differs by board
+revision (`RGB_LED_PIN` in `platformio.ini`: 48 on v1.0, 38 on v1.1).
+
+**Link watchdog.** The bridge parses (never alters) the PC's packets and tracks which IDs may hold
+torque: a WRITE / SYNC_WRITE that sets register 40 non-zero or touches the goal block 42–47 adds
+the ID, a write of register 40 = 0 removes it. While any ID is tracked, the bridge sends torque off
+when
+
+- no byte has come from the PC for 500 ms (`WATCHDOG_MS`; the GUI polls at 50 Hz, and
+  `verify-motion` pauses at most 0.3 s with torque on), or
+- the PC closes the port or its process dies (DTR drops), or USB is suspended.
+
+It waits for 2 ms of bus silence, finishes any half-sent PC packet with a deliberately wrong
+checksum (so the servos discard it), then sends the broadcast WRITE "register 40 = 0" three
+times. LED: dim blue = idle, green = torque tracked, red = watchdog fired (until the PC sends
+again). A clean shutdown of the GUI or a CLI command switches torque off itself, so the watchdog
+stays quiet. The broadcast only reaches servos at the bus's current baud rate.
+
 ## Pre-flight hardware checklist (before first power-up)
 
 1. Multimeter on both soldered harnesses: no short between VCC / GND / SIG; continuity from every
@@ -102,6 +163,8 @@ Serial ports: macOS uses `/dev/cu.*` (the tool maps `/dev/tty.*` to `cu.*` for y
    servo power.
 5. Rest the hand with every joint free (nothing pressed against a hard surface). This is an extra
    safeguard on top of the software guard.
+6. With the ESP32 bridge: TTL levels checked (3.3 V on GPIO18), ESP32 powered independently of the
+   PC link, and `diagnose` S1/S2 passing through the bridge before any write.
 
 ## Why IDs must be assigned first
 
@@ -134,7 +197,7 @@ not come back OK. Pass `--all-traffic` to record every exchange.
 | S2 echo | PINGs unused ID 253. If the adapter echoes TX, the SDK would treat the echo as a servo reply, so the run aborts. |
 | S3 ID scan | PINGs 0–253 (or `--ids`), with 2 retries per ID. `--baud-sweep` tries all 8 SCS baud rates if nothing answers at 1 Mbps. |
 | S4 link assessment | Per ID: reads of the present-state block, ID-register reads, then 100 PINGs. Each ID gets one of four verdicts (below). |
-| S5 registers | Only for `HEALTHY_SINGLE`: reads registers 0–70 in chunks, decodes them and runs sanity checks: END byte-order flag, ID, baud, voltage 4.5–5.5 V, temperature, torque off, position within angle limits, status, moving flag. |
+| S5 registers | Only for `HEALTHY_SINGLE`: identifies the model from registers 0–4, reads its memory table in chunks (0–70 SCS0009, 0–86 HLS3606), decodes it with that model's map and byte order, and runs sanity checks: model vs `JOINTS`, ID, baud, voltage, temperature, torque off, position within angle limits, status, moving flag; for the HLS also multi-turn mode (limits 0/0), operating mode, angle resolution and position offset. A fleet check fails when an HLS secondary ID equals another servo's or joint's ID. |
 
 S4 verdicts:
 
@@ -242,6 +305,67 @@ These limits are enforced at packet level by the motion policy: a goal outside
 limits cannot be armed. `max_speed` (default 150 steps/s) caps every generated trajectory for that
 joint.
 
+## Servo models (SCS0009 and HLS3606)
+
+Each `JOINTS` entry names its servo model; the default is `"scs0009"`. Both models speak the same
+packet protocol, so they share one bus, and one SYNC_WRITE can carry goal blocks for both, each
+encoded for its servo. Everything else is per model ([models.py](dexhand_servo/models.py)):
+
+| | SCS0009 | HLS3606 |
+|---|---|---|
+| 16-bit byte order (register 2, END) | big-endian (1) | little-endian (0) |
+| Position | 0–1023 over ~300°, 0.293°/step | 0–4095 per turn, 0.088°/step; BIT15 = sign in multi-turn mode |
+| Speed register | ~steps/s (load-dependent), 0 = maximum | 0.732 RPM ≈ 50 steps/s per unit, 0 = stop; the servo's speed loop really limits speed |
+| Register 44 in the goal block | goal time (always 0) | goal current, 6.5 mA per unit |
+| EEPROM lock | 48 | 55 (48 is the torque limit) |
+| Secondary ID | none | register 7: the servo also obeys WRITEs to this ID |
+| Current reading | none | register 69 (mA) |
+
+```python
+JOINTS = {
+    1: JointConfig("triple_pip", min_position=350, max_position=730),          # SCS0009
+    6: JointConfig("thumb_mcp_rot", min_position=1700, max_position=2400, max_speed=500,
+                   model="hls3606", current_limit_ma=2000, position_offset=-2044),
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `model` | `"scs0009"` (default) or `"hls3606"`; checked against the servo before every arming |
+| `min_position`, `max_position`, `max_speed` | in that servo's own steps and steps/s (HLS: 0–4095) |
+| `current_limit_ma` | HLS only: cap for the goal current; `None` uses the servo's protection current (register 28, 5.2 A on the first unit) |
+| `position_offset` | HLS only: the EEPROM position offset (register 31) the travel was measured with |
+
+`MotionConfig` thresholds (tolerances, jog steps, tracking / stall / mismatch limits, acceleration,
+arming and streaming speeds) and the `verify-motion` arguments are written in SCS0009 steps and are
+converted per joint, so an HLS joint gets the same angles and angular speeds. `DEFAULT_MAX_SPEED`
+(150 steps/s) is therefore slow on an HLS joint (~13°/s); set `max_speed` from
+`verify-motion --speed-sweep`.
+
+**Arming an HLS joint** additionally requires, read from the servo each time: single-turn mode
+with EEPROM angle limits that contain the configured travel, operating mode 0, angle resolution 1,
+the configured position offset, a non-negative position, and a valid protection current. The goal
+current sent with every goal is `min(protection current, current_limit_ma)`.
+
+### HLS3606 bring-up
+
+HLS servos may leave the factory in multi-turn mode (angle limits 0/0): the servo then does not
+limit travel, and with full-angle feedback the position can go negative after crossing zero.
+
+1. Assign a unique ID with `assign-id` as for the SCS0009 (the lock is register 55).
+2. `uv run dexhand-servo diagnose --ids K`: model HLS3606, multi-turn warning expected.
+3. Optional, recommended: `uv run dexhand-servo hls-setup --id K --center` with the joint at rest
+   mid-travel. Writes the position offset that puts the present position at 2048, far from the
+   0/4095 seam (refused once the joint has travel limits in `JOINTS`). Power-cycle.
+4. Measure the travel with `monitor` (in HLS steps), enter it in `JOINTS` with
+   `model="hls3606"` and `position_offset=` the value written in step 3.
+5. `uv run dexhand-servo hls-setup --id K --limits-from-config`: writes that travel as the EEPROM
+   angle limits (both in one 4-byte WRITE), which also leaves multi-turn mode. Power-cycle.
+6. `diagnose --ids K` must be clean, then `verify-motion --id K`, then the GUI.
+
+`hls-setup --show` prints limits, offset, mode and position; `--restore` writes back the values
+saved in `data/servo_tuning/id<K>_hls_original.json` before the first change.
+
 ## Driving the hand: `verify-motion` and `gui`
 
 ### Before the first motion
@@ -293,16 +417,26 @@ Compare them between `--rate 50/100` and `--stream-speed dynamic/fixed`.
 
 On startup every joint is switched to torque off. Nothing moves until you arm a joint.
 
+**Incomplete servo sets.** Joints that do not reply at startup are shown as **OFFLINE**: they are
+not polled, do not block the other joints, are left out of the torque-off confirmation and cannot
+be armed, so a single servo can be debugged on its own. After connecting more servos, press
+**Rescan bus** (enabled only while no joint is armed): it reads every configured joint again,
+switches newly found ones to torque off and redoes the HLS secondary-ID census. A joint that
+stops replying *after* it was online is still treated as a communication loss (arming blocked;
+all joints torque off if any is armed). Arming still needs a `JOINTS` entry with travel limits and
+a matching servo model.
+
 | Area | Content |
 |---|---|
-| Top bar | link and loop rate, mode selector, Arm all / Torque off all / Stop motion / Reset faults, **E-STOP** |
+| Top bar | link and loop rate (and how many joints are offline), mode selector, Arm all / Torque off all / Stop motion / Reset faults / Rescan bus, **E-STOP** |
 | Banner | latched E-stop or fault, lost communication, unconfirmed torque-off ("cut servo power"), moves in progress |
 | Joint panels (4×2) | arm/disarm button, travel bar (white dot = actual, blue triangle = target), target slider, position (steps/°), target, **load %**, voltage, temperature, comm health, faults and warnings |
 | Mode page | slider · poses · sync move · jog · teach/playback |
 | Log | every event; also written to `reports/session_*.log` |
 
-**Load instead of current:** the SCS0009 has no usable current register (69–70 always read 0),
-so the panels show load in % of maximum torque (register 60).
+**Load and current:** the SCS0009 has no usable current register (69–70 always read 0), so the
+panels show load (drive duty in %, register 60). HLS3606 panels also show the phase current
+(register 69, mA). Positions are shown in each servo's own steps, with degrees per model.
 
 **E-stop:**
 - the red button, **Esc** (always), or **Space** (except while typing in a text field);
@@ -384,6 +518,7 @@ register 300.
 | Communication | 3 failed reads in a row | **all** off; arming blocked |
 | Supply | median outside 5.5–6.5 V for 0.2 s | **all** off; arming blocked |
 | Temperature | ≥ 65 °C for 1 s (warning at 55 °C) | that joint |
+| HLS3606 current at its goal-current cap | ≥ 90 % of the cap for 0.2 s (`current_trip_frac`, `current_trip_s`) | that joint |
 | GUI heartbeat | > 0.5 s: motion frozen · > 2 s | **all** off |
 | Parked under load: setpoint still, ≥ 3 steps short, load ≥ 25 % | for 3 s | warning in the panel and the log (the servo keeps pushing and heats up); no automatic stop |
 
@@ -429,19 +564,29 @@ buzzing or oscillation.
 3. GUI: arm one joint and jog it slowly towards each end of its travel, watching the load.
 4. Trip tests with one joint armed:
    - hold the finger;
-   - unplug USB while it is holding;
+   - unplug USB while it is holding (with the ESP32 bridge: also kill the GUI process; the joint
+     should go limp within ~0.5 s and the LED turn red);
    - lower the supply to 5.4 V.
 5. All joints at low speed, then poses, sync moves and playback. Raise `max_speed` per joint only
    after that.
 
 ## Caveats
 
-- The register map in [registers.py](dexhand_servo/registers.py) comes from a third-party SCSCL
-  table and the SDK constants. Decoded values are indicative only. The raw 0–70 bytes are always
-  stored, so check them against the official SCS0009 manual.
-- 16-bit values are decoded big-endian (potentiometer servos; SDK `scscl` uses `protocol_end=1`).
-  Register 2 (END) is checked to confirm this.
+- The SCS0009 register map in [registers.py](dexhand_servo/registers.py) comes from a third-party
+  SCSCL table and the SDK constants. Decoded values are indicative only. The raw bytes are always
+  stored, so check them against the official SCS0009 manual. The HLS3606 map follows the official
+  Feetech table ([docs/hls-memory-table.md](docs/hls-memory-table.md)).
+- 16-bit values are decoded big-endian on the SCS0009 and little-endian on the HLS3606; the model
+  (and so the byte order) is identified from registers 0–4 (END flag, servo version).
+- The HLS manual does not say whether EEPROM angle limits and the position offset apply without a
+  power cycle, nor the sign convention of the offset; `hls-setup` reads everything back and asks
+  for a power cycle followed by `diagnose`.
 - The URT-2's USB-serial chip is not documented publicly. If `list-ports` shows nothing, install
   the chip vendor's driver (WCH CH34x is built into recent macOS; on Windows, install WCH's CH341SER
   driver if Device Manager shows an unknown USB device).
 - After `assign-id`, power-cycle and re-run `diagnose` to confirm the ID persisted in EEPROM.
+- The ESP32 bridge adds USB-to-UART forwarding time to every exchange. Compare `diagnose` latency
+  p50/p99 through the bridge with a direct URT-2 run before relying on the GUI's
+  `MotionConfig.control_latency_ms` (4 ms); raise it if replies time out.
+- The bridge is USB only for now. A WiFi link needs batched bus exchanges: a 50 Hz cycle makes
+  about ten request/reply round trips, which a per-packet WiFi bridge cannot fit.

@@ -3,6 +3,10 @@
 Two uses: characterise feedback noise (e.g. a servo whose position jumps with
 torque off) and measure a joint's mechanical range by moving it by hand while
 min/max are recorded. Only READ packets are sent.
+
+Each servo's model is read once at the start (registers 0..4) and its samples are decoded
+with that model; HLS3606 samples also carry the phase current. Positions and speeds stay
+in each servo's own units.
 """
 
 from __future__ import annotations
@@ -16,11 +20,14 @@ from datetime import datetime
 from itertools import pairwise
 from pathlib import Path
 
-from .registers import PRESENT_BLOCK_ADDR, PRESENT_BLOCK_LEN, decode
+from .diagnostics import read_identity
+from .models import SCS0009, ServoModel
+from .registers import PRESENT_BLOCK_ADDR, PRESENT_BLOCK_LEN
 from .safe_bus import SafeBus
 
 # SCS0009 nominal: 300 degrees over 0..1023 (datasheet value; verify per joint if precision matters).
-DEG_PER_STEP = 300.0 / 1024
+DEG_PER_STEP = SCS0009.deg_per_step
+CURRENT_BLOCK_LEN = 15  # 56..70: present block plus present current (HLS3606)
 
 SPARK_CHARS = "▁▂▃▄▅▆▇█"
 
@@ -34,6 +41,7 @@ class Sample:
     load: float | None = None
     voltage: float | None = None
     temperature: int | None = None
+    current_ma: float | None = None
 
 
 @dataclass
@@ -53,10 +61,12 @@ class SeriesStats:
     voltage_max: float | None
     temperature_max: int | None
     last_position: int | None
+    deg_per_step: float = DEG_PER_STEP
+    jump_threshold: int | None = None
 
     @property
     def spread_deg(self) -> float | None:
-        return None if self.position_spread is None else round(self.position_spread * DEG_PER_STEP, 1)
+        return None if self.position_spread is None else round(self.position_spread * self.deg_per_step, 1)
 
     def to_dict(self) -> dict[str, object]:
         return {**self.__dict__, "spread_deg": self.spread_deg}
@@ -71,6 +81,7 @@ class MonitorResult:
     rate_hz: float
     duration_s: float
     series: dict[int, list[Sample]] = field(default_factory=dict)
+    models: dict[int, ServoModel | None] = field(default_factory=dict)  # None: unidentified, decoded as SCS0009
     elapsed_s: float = 0.0
     cycles: int = 0
     overruns: int = 0
@@ -81,7 +92,12 @@ class MonitorResult:
         return self.cycles / self.elapsed_s if self.elapsed_s else 0.0
 
 
-def compute_stats(servo_id: int, samples: list[Sample], jump_threshold: int) -> SeriesStats:
+def compute_stats(
+    servo_id: int, samples: list[Sample], jump_threshold: int, model: ServoModel | None = None
+) -> SeriesStats:
+    """`jump_threshold` is in SCS0009 steps and is scaled to the servo's own steps."""
+    model = model or SCS0009
+    jump_threshold = model.scs_steps(jump_threshold)
     clean = [s for s in samples if s.position is not None]
     positions = [s.position for s in clean]
     steps = [abs(b - a) for a, b in pairwise(positions)]
@@ -103,6 +119,8 @@ def compute_stats(servo_id: int, samples: list[Sample], jump_threshold: int) -> 
         voltage_max=max(voltages) if voltages else None,
         temperature_max=max(temperatures) if temperatures else None,
         last_position=positions[-1] if positions else None,
+        deg_per_step=model.deg_per_step,
+        jump_threshold=jump_threshold,
     )
 
 
@@ -143,17 +161,22 @@ def run_monitor(
     start = time.perf_counter()
     next_cycle = start
     try:
+        result.models = {servo_id: read_identity(bus, servo_id)[0] for servo_id in ids}
         while True:
             for servo_id in ids:
-                t = bus.read(servo_id, PRESENT_BLOCK_ADDR, PRESENT_BLOCK_LEN)
+                model = result.models[servo_id] or SCS0009
+                length = CURRENT_BLOCK_LEN if model.current_ma_per_unit else PRESENT_BLOCK_LEN
+                t = bus.read(servo_id, PRESENT_BLOCK_ADDR, length)
                 sample = Sample(t=round(time.perf_counter() - start, 5), result=t.result.value)
-                if t.ok and len(t.data) == PRESENT_BLOCK_LEN:
-                    d = decode(t.data, base_addr=PRESENT_BLOCK_ADDR)
+                if t.ok and len(t.data) == length:
+                    d = model.decode(t.data, base_addr=PRESENT_BLOCK_ADDR)
                     sample.position = int(d["present_position"].value)
                     sample.speed = int(d["present_speed"].value)
                     sample.load = float(d["present_load"].value)
                     sample.voltage = float(d["present_voltage"].value)
                     sample.temperature = int(d["present_temperature"].value)
+                    if "present_current" in d and model.current_ma_per_unit:
+                        sample.current_ma = float(d["present_current"].value)
                 result.series[servo_id].append(sample)
             result.cycles += 1
             result.elapsed_s = time.perf_counter() - start
@@ -185,8 +208,11 @@ def write_csv(result: MonitorResult, path: Path) -> Path:
     )
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["t_s", "id", "result", "position", "speed", "load_pct", "voltage_v", "temperature_c"])
+        writer.writerow(["t_s", "id", "model", "result", "position", "speed", "load_pct", "voltage_v",
+                         "temperature_c", "current_ma"])
         for t, servo_id, s in rows:
-            writer.writerow([t, servo_id, s.result, s.position, s.speed, s.load, s.voltage, s.temperature])
+            model = result.models.get(servo_id)
+            writer.writerow([t, servo_id, model.key if model else "", s.result, s.position, s.speed, s.load,
+                             s.voltage, s.temperature, s.current_ma])
     return path
 

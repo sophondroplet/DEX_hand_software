@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 from .config import JOINT_MAP
-from .monitor import DEG_PER_STEP, MonitorResult, SeriesStats
+from .monitor import MonitorResult, SeriesStats
 
 
 def monitor_payload(
@@ -23,13 +23,13 @@ def monitor_payload(
             "overruns": result.overruns,
             "interrupted": result.interrupted,
             "jump_threshold": jump_threshold,
-            "deg_per_step": DEG_PER_STEP,
             "csv_name": csv_name,
         },
         "servos": [
             {
                 "id": servo_id,
                 "joint": JOINT_MAP.get(servo_id, "-"),
+                "model": model.label if (model := result.models.get(servo_id)) else "?",
                 "t": [s.t for s in samples],
                 "position": [s.position for s in samples],
                 "voltage": [s.voltage for s in samples],
@@ -192,10 +192,12 @@ footer { color: var(--text-muted); font-size: 12px; }
     `${meta.achieved_rate_hz} Hz (requested ${meta.rate_hz} Hz)` +
     (meta.interrupted ? " · stopped with Ctrl-C" : "") +
     (meta.overruns ? ` · ${meta.overruns} rate overruns` : "");
-  document.getElementById("jump-head").textContent = `Jumps > ${meta.jump_threshold}`;
+  document.getElementById("jump-head").textContent = `Jumps > ${meta.jump_threshold} (SCS0009 steps)`;
   document.getElementById("footer").textContent =
     `Read-only capture. Per-sample data: ${meta.csv_name}. ` +
-    `Degrees use the nominal ${(meta.deg_per_step).toFixed(3)} deg/step (300 deg over 1024 steps).`;
+    `Positions are in each servo's own steps; degrees use the nominal deg/step of its model ` +
+    `(SCS0009: 300 deg over 1024 steps; HLS3606: 360 deg over 4096 steps). ` +
+    `Jump thresholds are scaled to the same angle per model.`;
 
   const summary = document.getElementById("summary");
   for (const s of data.servos) {
@@ -334,11 +336,11 @@ footer { color: var(--text-muted); font-size: 12px; }
     const st = s.stats;
     const card = el("section", { class: "card" });
     const head = el("div", { class: "servo-head" });
-    head.appendChild(el("h2", {}, `ID ${s.id} · ${s.joint}`));
+    head.appendChild(el("h2", {}, `ID ${s.id} · ${s.joint} · ${s.model}`));
     head.appendChild(el("p", {},
       st.position_spread === null ? "no clean samples"
         : `range ${st.position_min}–${st.position_max} (${st.position_spread} steps ≈ ${fmt(st.spread_deg, 1)} deg), ` +
-          `max step ${fmt(st.max_step)}, ${st.jumps} jump(s) > ${meta.jump_threshold}`));
+          `max step ${fmt(st.max_step)}, ${st.jumps} jump(s) > ${st.jump_threshold}`));
     card.appendChild(head);
 
     const charts = el("div", { class: "charts" });

@@ -25,7 +25,16 @@ from PySide6.QtWidgets import (
 
 from ..control.snapshot import HandSnapshot
 from ..control.storage import DATA_DIR, PoseLibrary
-from ..control.worker import ArmJoints, Controller, DisarmJoints, Mode, ResetFaults, SetMode, StopMotion
+from ..control.worker import (
+    ArmJoints,
+    Controller,
+    DisarmJoints,
+    Mode,
+    RescanBus,
+    ResetFaults,
+    SetMode,
+    StopMotion,
+)
 from . import theme
 from .joint_panel import JointPanel
 from .modes import JogPage, ModePage, PosePage, SliderPage, SyncPage, TeachPage
@@ -54,6 +63,9 @@ class MainWindow(QMainWindow):
         disarm_all = QPushButton("Torque off all")
         stop_motion = QPushButton("Stop motion")
         reset = QPushButton("Reset faults")
+        self.rescan = QPushButton("Rescan bus")
+        self.rescan.setToolTip("Find servos connected since startup and redo the HLS secondary-ID census "
+                               "(only while no joint is armed)")
         self.estop_button = QPushButton("E-STOP")
         self.estop_button.setObjectName("estop")
         self.estop_button.setToolTip("Torque off on every joint (also: Esc, or Space outside text fields)")
@@ -61,6 +73,7 @@ class MainWindow(QMainWindow):
         disarm_all.clicked.connect(lambda: controller.submit(DisarmJoints(tuple(joints))))
         stop_motion.clicked.connect(lambda: controller.submit(StopMotion()))
         reset.clicked.connect(lambda: controller.submit(ResetFaults()))
+        self.rescan.clicked.connect(lambda: controller.submit(RescanBus()))
         self.estop_button.clicked.connect(lambda: controller.estop("button"))
         top = QHBoxLayout()
         top.addWidget(self.link)
@@ -68,7 +81,7 @@ class MainWindow(QMainWindow):
         top.addWidget(QLabel("Mode"))
         top.addWidget(self.mode)
         top.addSpacing(16)
-        for button in (arm_all, disarm_all, stop_motion, reset):
+        for button in (arm_all, disarm_all, stop_motion, reset, self.rescan):
             top.addWidget(button)
         top.addStretch(1)
         top.addWidget(self.estop_button)
@@ -161,7 +174,9 @@ class MainWindow(QMainWindow):
         armed = sum(1 for j in snap.joints.values() if j.armed)
         rate = f"{snap.cycle_hz:4.0f} Hz" if running else "STOPPED"
         busy = f"cycle {snap.cycle_busy_ms:.1f}/{snap.cycle_budget_ms:.0f} ms"
-        self.link.setText(f"{snap.port} · loop {rate} · {busy} · {armed}/{len(snap.joints)} armed")
+        offline = f" · {len(snap.offline)} offline" if snap.offline else ""
+        self.link.setText(f"{snap.port} · loop {rate} · {busy} · {armed}/{len(snap.joints)} armed{offline}")
+        self.rescan.setEnabled(running and armed == 0)
         slider_mode = snap.mode == Mode.SLIDER.value
         for servo_id, panel in self.panels.items():
             state = snap.joints.get(servo_id)

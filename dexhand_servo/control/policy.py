@@ -1,12 +1,14 @@
 """Packet-level motion policy: the last line of defence against an unsafe goal reaching a servo.
 
-Checked by `SafeBus` at both choke points, on the actual wire bytes (16-bit values
-big-endian), independently of whatever code built the packet:
+Checked by `SafeBus` at both choke points, on the actual wire bytes (16-bit values in the
+byte order of each joint's servo model), independently of whatever code built the packet:
 
 - WRITE 40 (torque), 1 byte: 0 for any known ID; 1 only for armed IDs.
-- WRITE 42, 6 bytes (goal position, time, speed): armed ID, position inside the
-  joint's travel, time == 0, 1 <= speed <= the joint's speed cap. Speed 0 means
-  "maximum speed" on SCS servos and is always refused. When the joint has a
+- WRITE 42, 6 bytes (goal position, third word, speed): armed ID, position inside the
+  joint's travel, 1 <= speed <= the joint's speed cap. The third word is the goal time on
+  the SCS0009 (must be 0) and the goal current on the HLS3606 (1 <= current <= the cap
+  verified at arming); on the HLS no word may carry the sign bit. Speed 0 means "maximum
+  speed" on SCS servos ("stop" on the HLS) and is always refused. When the joint has a
   `max_goal_step`, the goal may differ from the previous accepted goal by at most
   that many steps: the SCS0009 speed register does not reliably limit speed, so
   this per-packet jump limit is what stops a stray far-away goal from being
@@ -19,8 +21,9 @@ big-endian), independently of whatever code built the packet:
 - SYNC_WRITE at 40 (1 byte per ID): torque-off only (all values 0).
 - Everything else (EEPROM, lock, REG_WRITE/ACTION, other registers) is refused.
 
-The armed set may only be changed by `control.arming`. With nothing armed the
-policy is read-only plus torque-off, so an E-stop can always be sent.
+The armed set may only be changed by `control.arming`, which first verifies the servo
+against its JointConfig (`VerifiedIdentity`). With nothing armed the policy is read-only
+plus torque-off, so an E-stop can always be sent.
 """
 
 from __future__ import annotations
@@ -33,29 +36,42 @@ from dataclasses import dataclass
 from scservo_sdk.protocol_packet_handler import PKT_ID, PKT_LENGTH, PKT_PARAMETER0
 
 from ..config import JointConfig, MotionConfig
+from ..models import SCS0009, ServoModel
 from ..registers import REG_TORQUE_ENABLE
 from ..safe_bus import UnsafeOperationError, WritePolicy
 
 REG_GOAL_BLOCK = 42
 GOAL_BLOCK_LEN = 6
+HLS_CURRENT_MAX = 2047  # register 44 range (6.5 mA units)
 
 
 @dataclass(frozen=True)
 class JointLimits:
     min_position: int
     max_position: int
-    speed_cap: int
+    speed_cap: int  # speed register
     max_goal_step: int | None = None  # None: no per-packet jump limit (verify-motion's slow test moves)
-    max_speed: int | None = None  # speed cap for a pre-authorised single-write goal; None: never authorised
+    max_speed: int | None = None  # speed register cap for a pre-authorised single-write goal; None: never authorised
+    model: ServoModel = SCS0009
+
+
+@dataclass(frozen=True)
+class VerifiedIdentity:
+    """What `control.arming.verify_identity` confirmed on the servo; required to arm it."""
+
+    servo_id: int
+    model: ServoModel
+    current_cap: int | None = None  # HLS3606 goal current (6.5 mA units); None on the SCS0009
 
 
 def be16(value: int) -> bytes:
     return bytes([(value >> 8) & 0xFF, value & 0xFF])
 
 
-def goal_block(position: int, speed: int) -> bytes:
-    """Wire bytes for registers 42..47: goal position, goal time (always 0), goal speed."""
-    return be16(position) + be16(0) + be16(speed)
+def goal_block(position: int, speed: int, model: ServoModel = SCS0009, current: int = 0) -> bytes:
+    """Wire bytes for registers 42..47: goal position, goal time (SCS0009, always 0) or goal current (HLS3606),
+    speed register."""
+    return model.goal_block(position, speed, current)
 
 
 def limits_from_config(
@@ -65,47 +81,82 @@ def limits_from_config(
     for servo_id, joint in joints.items():
         if joint.has_travel_limits:
             assert joint.min_position is not None and joint.max_position is not None
+            model = joint.servo_model
+            # The single-write register may not exceed max_speed: round down (None when even 1 is too fast).
+            single = joint.max_speed if model is SCS0009 else model.speed_register(joint.max_speed, floor=True)
             limits[servo_id] = JointLimits(
                 joint.min_position,
                 joint.max_position,
-                max(motion.stream_speed_register, motion.arm_speed),
+                motion.speed_cap(model, joint.max_speed),
                 motion.max_goal_step(joint) if step_guard else None,
-                joint.max_speed,
+                single or None,
+                model,
             )
     return limits
 
 
 class MotionPolicy(WritePolicy):
-    def __init__(self, limits: Mapping[int, JointLimits], known_ids: Sequence[int] | None = None) -> None:
+    def __init__(
+        self,
+        limits: Mapping[int, JointLimits],
+        known_ids: Sequence[int] | None = None,
+        models: Mapping[int, ServoModel] | None = None,
+    ) -> None:
         super().__init__("motion")
         self.limits = dict(limits)
         self.known_ids = frozenset(known_ids if known_ids is not None else limits)
+        self._models = {i: lim.model for i, lim in self.limits.items()} | dict(models or {})
         self._armed: frozenset[int] = frozenset()
         self._last_goal: dict[int, int] = {}
         self._authorized: dict[int, tuple[int, int]] = {}  # servo ID -> (position, speed), see authorize_goals
+        self._current: dict[int, int] = {}  # armed HLS joints: goal current cap from their VerifiedIdentity
         self._lock = threading.Lock()
 
     @property
     def armed(self) -> frozenset[int]:
         return self._armed
 
-    def add_armed(self, servo_id: int) -> None:
-        if servo_id not in self.limits:
+    def model(self, servo_id: int) -> ServoModel:
+        return self._models.get(servo_id, SCS0009)
+
+    def current_cap(self, servo_id: int) -> int | None:
+        return self._current.get(servo_id)
+
+    def add_armed(self, servo_id: int, identity: VerifiedIdentity) -> None:
+        limits = self.limits.get(servo_id)
+        if limits is None:
             raise UnsafeOperationError(f"ID {servo_id} has no travel limits and cannot be armed")
+        if identity.servo_id != servo_id or identity.model is not limits.model:
+            raise UnsafeOperationError(f"ID {servo_id} cannot be armed: verified identity {identity} does not match "
+                                       f"the configured {limits.model.label}")
+        if limits.model.goal_third_word == "goal_current":
+            if identity.current_cap is None or not 1 <= identity.current_cap <= HLS_CURRENT_MAX:
+                raise UnsafeOperationError(f"ID {servo_id} cannot be armed without a goal-current cap "
+                                           f"(got {identity.current_cap})")
+        elif identity.current_cap is not None:
+            raise UnsafeOperationError(f"ID {servo_id}: the {limits.model.label} takes no goal current")
         with self._lock:
             self._armed = self._armed | {servo_id}
+            if identity.current_cap is not None:
+                self._current[servo_id] = identity.current_cap
 
     def remove_armed(self, servo_id: int) -> None:
         with self._lock:
             self._armed = self._armed - {servo_id}
             self._last_goal.pop(servo_id, None)
             self._authorized.pop(servo_id, None)
+            self._current.pop(servo_id, None)
 
     def clear_armed(self) -> None:
         with self._lock:
             self._armed = frozenset()
             self._last_goal.clear()
             self._authorized.clear()
+            self._current.clear()
+
+    def encode_goal(self, servo_id: int, position: int, speed: int) -> bytes:
+        """Goal block for an armed joint, in its model's byte order, carrying its goal-current cap on the HLS."""
+        return goal_block(position, speed, self.model(servo_id), self._current.get(servo_id, 0))
 
     def seed_goal(self, servo_id: int, position: int) -> None:
         """Reference for the jump limit: the position the joint holds when it is armed."""
@@ -146,15 +197,21 @@ class MotionPolicy(WritePolicy):
         if servo_id not in self._armed:
             raise UnsafeOperationError(f"goal for ID {servo_id} refused: joint is not armed")
         limits = self.limits[servo_id]
-        position = (data[0] << 8) | data[1]
-        goal_time = (data[2] << 8) | data[3]
-        speed = (data[4] << 8) | data[5]
+        model = limits.model
+        position, third, speed = model.parse_goal_block(data)
+        if model.position_sign_bit is not None and (position | third | speed) & (1 << model.position_sign_bit):
+            raise UnsafeOperationError(f"goal block for ID {servo_id} refused: sign bit set ({bytes(data).hex()})")
         if not limits.min_position <= position <= limits.max_position:
             raise UnsafeOperationError(
                 f"goal {position} for ID {servo_id} outside travel [{limits.min_position}, {limits.max_position}]"
             )
-        if goal_time != 0:
-            raise UnsafeOperationError(f"goal time {goal_time} refused (only speed-controlled moves are allowed)")
+        if model.goal_third_word == "goal_time":
+            if third != 0:
+                raise UnsafeOperationError(f"goal time {third} refused (only speed-controlled moves are allowed)")
+        else:
+            cap = self._current.get(servo_id)
+            if cap is None or not 1 <= third <= cap:
+                raise UnsafeOperationError(f"goal current {third} for ID {servo_id} outside 1..{cap}")
         if not 1 <= speed <= limits.speed_cap:
             raise UnsafeOperationError(f"speed {speed} for ID {servo_id} outside 1..{limits.speed_cap}")
         if limits.max_goal_step is not None:

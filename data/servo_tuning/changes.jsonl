@@ -28,3 +28,5 @@
 {"servo_id": 8, "joint": "thumb_ip", "time": "2026-10-10T17:52:30", "p_gain": 40, "d_gain": 15, "min_start": 0, "action": "tune", "change": {"p_gain": 50, "min_start": 0}}
 {"servo_id": 7, "joint": "thumb_mcp", "time": "2026-10-10T17:57:47", "p_gain": 45, "d_gain": 15, "min_start": 0, "action": "tune", "change": {"p_gain": 45, "min_start": 1}}
 {"servo_id": 7, "joint": "thumb_mcp", "time": "2026-10-10T18:05:37", "p_gain": 45, "d_gain": 15, "min_start": 1, "action": "tune", "change": {"p_gain": 45, "min_start": 0}}
+{"servo_id": 1, "model": "hls3606", "time": "2026-10-17T15:31:14", "min_angle": 0, "max_angle": 0, "offset": 0, "action": "hls-setup limits", "before": {"min_angle": 0, "max_angle": 0, "offset": 0, "mode": 0, "torque": 0, "position": 424}, "change": {"min_angle": 350, "max_angle": 730}}
+{"servo_id": 1, "model": "hls3606", "time": "2026-10-19T12:06:36", "min_angle": 350, "max_angle": 730, "offset": 0, "action": "hls-setup limits", "before": {"min_angle": 350, "max_angle": 730, "offset": 0, "mode": 0, "torque": 0, "position": 530}, "change": {"min_angle": 350, "max_angle": 2000}}

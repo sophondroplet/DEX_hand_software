@@ -26,6 +26,7 @@ def gui(qtbot, qapp, tmp_path, monkeypatch):
     monkeypatch.setattr("dexhand_servo.gui.main_window.DATA_DIR", tmp_path)
     fake = simulated_hand()
     bus = SafeBus("simulated", 1_000_000, latency_ms=2, serial_factory=fake.serial_factory)
+    bus.census = {}  # census taken: no HLS secondary IDs
     bus.open()
     controller = Controller(bus, JOINTS, MotionConfig())
     apply_dark_theme(qapp)
@@ -138,3 +139,60 @@ def test_pose_page_single_write_option(gui, qtbot) -> None:
     assert "single-write move 'center' sent: 1 joints" in window.log.toPlainText()
     qtbot.waitUntil(lambda: abs(fake.servo(1).position - center) <= 1, timeout=3000)  # streaming holds the goal
     assert not controller.snapshot().faults
+
+
+def test_hls_joint_panel_shows_its_own_units(qtbot, qapp, tmp_path, monkeypatch) -> None:
+    from dexhand_servo.config import JointConfig
+    from dexhand_servo.diagnostics import take_census
+
+    joints = dict(JOINTS)
+    joints[6] = JointConfig("thumb_mcp_rot", 1800, 2300, max_speed=500, model="hls3606")
+    monkeypatch.setattr("dexhand_servo.sim.JOINTS", joints)
+    monkeypatch.setattr("dexhand_servo.gui.main_window.DATA_DIR", tmp_path)
+    fake = simulated_hand()
+    bus = SafeBus("simulated", 1_000_000, latency_ms=2, serial_factory=fake.serial_factory)
+    bus.open()
+    take_census(bus, ids=range(12))
+    controller = Controller(bus, joints, MotionConfig())
+    window = MainWindow(controller, poll_ms=20)
+    qtbot.addWidget(window)
+    controller.start()
+    try:
+        qtbot.mouseClick(window.panels[6].torque_button, Qt.MouseButton.LeftButton)
+        qtbot.waitUntil(lambda: armed(controller, 6) and window.panels[6]._armed, timeout=3000)
+        panel = window.panels[6]
+        position = controller.snapshot().joints[6].reading.position
+        assert 1800 <= position <= 2300
+        assert "HLS3606 steps" in panel.travel.text()
+        assert f"({position * 360 / 4096:.1f}°)" in panel.values["pos"].text()
+        scs_id = next(i for i, joint in joints.items() if joint.model == "scs0009")
+        assert "mA" in panel.values["load"].text() and "mA" not in window.panels[scs_id].values["load"].text()
+    finally:
+        controller.stop()
+
+
+def test_missing_servo_panel_is_offline_and_rescan_follows_arming(qtbot, qapp, tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("dexhand_servo.gui.main_window.DATA_DIR", tmp_path)
+    fake = simulated_hand()
+    fake.servos = [s for s in fake.servos if s.servo_id != 2]
+    bus = SafeBus("simulated", 1_000_000, latency_ms=2, serial_factory=fake.serial_factory)
+    bus.census = {}  # census taken: no HLS secondary IDs
+    bus.open()
+    controller = Controller(bus, JOINTS, MotionConfig())
+    window = MainWindow(controller, poll_ms=20)
+    qtbot.addWidget(window)
+    controller.start()
+    try:
+        offline = window.panels[2]
+        qtbot.waitUntil(lambda: offline.chip.text() == "◌ OFFLINE", timeout=3000)
+        assert window.rescan.isEnabled()
+        assert not offline.torque_button.isEnabled() and not offline.slider.isEnabled()
+        assert "1 offline" in window.link.text()
+
+        qtbot.mouseClick(window.panels[1].torque_button, Qt.MouseButton.LeftButton)
+        qtbot.waitUntil(lambda: armed(controller, 1) and window.panels[1].slider.isEnabled(), timeout=3000)
+        assert not window.rescan.isEnabled(), "rescan only while nothing is armed"
+        qtbot.mouseClick(window.panels[1].torque_button, Qt.MouseButton.LeftButton)
+        qtbot.waitUntil(lambda: not armed(controller, 1) and window.rescan.isEnabled(), timeout=3000)
+    finally:
+        controller.stop()

@@ -14,7 +14,6 @@ from rich.table import Table
 from . import __version__
 from .config import JOINT_MAP, BringupConfig
 from .diagnostics import Check, DiagnoseReport, ServoReport, Severity, Verdict
-from .registers import DUMP_END, REGISTERS
 from .safe_bus import Transaction
 
 SEVERITY_STYLE = {Severity.PASS: "green", Severity.WARN: "yellow", Severity.FAIL: "red"}
@@ -31,6 +30,12 @@ def _present(servo: ServoReport, name: str) -> str:
     return str(source[name].value) if name in source else "-"
 
 
+def _model_label(servo: ServoReport) -> str:
+    if servo.dump is None:
+        return "-"
+    return servo.dump.model.label if servo.dump.model else "unknown"
+
+
 def render_diagnose(console: Console, report: DiagnoseReport) -> None:
     console.rule(f"[bold]Diagnose {report.port} @ {report.baudrate} bps")
     for stage in report.stages:
@@ -41,7 +46,7 @@ def render_diagnose(console: Console, report: DiagnoseReport) -> None:
 
     if report.servos:
         table = Table(title="Per-ID link assessment", show_lines=False)
-        for column in ("ID", "Joint", "Verdict", "Ping ok", "Read ok", "Corrupt", "p50/p99 ms",
+        for column in ("ID", "Joint", "Model", "Verdict", "Ping ok", "Read ok", "Corrupt", "p50/p99 ms",
                        "Pos", "Spread", "V", "degC", "Torque"):
             table.add_column(column)
         for servo in report.servos:
@@ -51,6 +56,7 @@ def render_diagnose(console: Console, report: DiagnoseReport) -> None:
             table.add_row(
                 str(a.servo_id),
                 JOINT_MAP.get(a.servo_id, "-"),
+                _model_label(servo),
                 f"[{style}]{a.verdict.value}[/]",
                 f"{a.ping.ok}/{a.ping.attempts}",
                 f"{a.read.ok}/{a.read.attempts}",
@@ -83,19 +89,22 @@ def render_diagnose(console: Console, report: DiagnoseReport) -> None:
 
 
 def _render_registers(console: Console, servo: ServoReport) -> None:
-    assert servo.dump is not None
-    table = Table(title=f"ID {servo.assessment.servo_id} registers (decoded, verify against datasheet)")
-    for column in ("Addr", "Name", "Area", "Raw", "Value", "Unit"):
-        table.add_column(column)
-    for reg in REGISTERS:
-        decoded = servo.dump.decoded.get(reg.name)
-        if decoded is None:
-            continue
-        table.add_row(str(reg.addr), reg.name, reg.area, str(decoded.raw), str(decoded.value), reg.unit)
-    console.print(table)
-    raw = servo.dump.raw
-    console.print("[dim]raw 0..70:[/]")
-    for start in range(0, DUMP_END, 16):
+    dump = servo.dump
+    assert dump is not None
+    if dump.model is not None:
+        table = Table(title=f"ID {servo.assessment.servo_id} registers ({dump.model.label}, decoded, "
+                            "verify against datasheet)")
+        for column in ("Addr", "Name", "Area", "Raw", "Value", "Unit"):
+            table.add_column(column)
+        for reg in dump.model.registers:
+            decoded = dump.decoded.get(reg.name)
+            if decoded is None:
+                continue
+            table.add_row(str(reg.addr), reg.name, reg.area, str(decoded.raw), str(decoded.value), reg.unit)
+        console.print(table)
+    raw = dump.raw
+    console.print(f"[dim]raw 0..{len(raw) - 1}:[/]")
+    for start in range(0, len(raw), 16):
         row = " ".join("--" if b is None else f"{b:02X}" for b in raw[start : start + 16])
         console.print(f"[dim]  {start:3d}: {row}[/]")
 
@@ -130,6 +139,7 @@ def _servo_dict(servo: ServoReport) -> dict[str, Any]:
         "aborted_early": a.aborted_early,
     }
     if servo.dump:
+        out["model"] = servo.dump.model.key if servo.dump.model else None
         out["registers_raw"] = servo.dump.raw
         out["registers_failed_chunks"] = servo.dump.failed_chunks
         out["registers"] = {

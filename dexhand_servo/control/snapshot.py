@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from ..registers import decode
+from ..models import SCS0009, ServoModel
 
 STATUS_BLOCK_ADDR = 40
-STATUS_BLOCK_LEN = 27  # registers 40..66: torque, goal, lock, present state, status, moving
+STATUS_BLOCK_LEN = SCS0009.status_block_len  # SCS0009 40..66: torque, goal, lock, present state, status, moving
 
 # Servo status-packet error bits (SDK protocol_packet_handler ERRBIT_*).
 ERROR_BITS = {1: "voltage", 2: "angle sensor", 4: "overheat", 8: "over-current", 32: "overload"}
@@ -21,7 +21,10 @@ def describe_error(byte: int) -> str:
 
 @dataclass(frozen=True)
 class ServoReading:
-    """One decoded read of registers 40..66."""
+    """One decoded read of the status block (40..66; 40..70 on the HLS3606, which adds the current).
+
+    Positions and speeds are in the servo's own units; `current_ma` is None without a current reading.
+    """
 
     torque: int
     goal: int
@@ -34,10 +37,12 @@ class ServoReading:
     status: int
     moving: int
     error_byte: int
+    current_ma: float | None = None
 
 
-def decode_status_block(data: list[int], error_byte: int) -> ServoReading:
-    d = decode(data, base_addr=STATUS_BLOCK_ADDR)
+def decode_status_block(data: list[int], error_byte: int, model: ServoModel = SCS0009) -> ServoReading:
+    d = model.decode(data, base_addr=STATUS_BLOCK_ADDR)
+    current = d.get("present_current") if model.current_ma_per_unit else None
     return ServoReading(
         torque=int(d["torque_enable"].value),
         goal=int(d["goal_position"].value),
@@ -50,6 +55,7 @@ def decode_status_block(data: list[int], error_byte: int) -> ServoReading:
         status=int(d["status"].value),
         moving=int(d["moving"].value),
         error_byte=error_byte,
+        current_ma=None if current is None else float(current.value),
     )
 
 
@@ -68,6 +74,8 @@ class JointState:
     setpoint: float | None  # rate-limited value actually sent this cycle
     fault: str | None  # latched fault for this joint
     warnings: tuple[str, ...] = ()
+    model: ServoModel = SCS0009
+    online: bool = True  # False: no reply at startup / last rescan; not polled, not armable
 
 
 @dataclass(frozen=True)
@@ -89,6 +97,7 @@ class HandSnapshot:
     cycle_busy_ms: float = 0.0  # smoothed time spent inside one control cycle
     cycle_budget_ms: float = 20.0
     notes: tuple[str, ...] = field(default_factory=tuple)
+    offline: tuple[int, ...] = ()  # joints that did not reply at startup / last rescan
 
 
 @dataclass(frozen=True)

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import statistics
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -11,17 +11,19 @@ from typing import Any
 
 from serial.tools import list_ports
 
-from .config import WCH_USB_VID, BringupConfig
+from .config import BRIDGE_PRODUCT, ESP32_USB_VID, WCH_USB_VID, BringupConfig
+from .models import SCS0009, ServoModel, identify
 from .registers import (
     BAUD_CODES,
     DUMP_END,
+    IDENTITY_LEN,
+    MAX_SERVO_ID,
     PRESENT_BLOCK_ADDR,
     PRESENT_BLOCK_LEN,
     REG_ID,
     DecodedValue,
-    decode,
 )
-from .safe_bus import CommResult, SafeBus, Transaction
+from .safe_bus import Census, CommResult, SafeBus, Transaction
 
 ProgressCallback = Callable[[str, int, int], None]
 
@@ -57,17 +59,35 @@ class Check:
 # ---------------------------------------------------------------- S0: port discovery
 
 
+class PortKind(str, Enum):
+    BRIDGE = "ESP32 bridge"  # firmware/urt_bridge in front of the URT-2
+    WCH = "URT-2 USB"  # the URT-2's own USB-serial chip (also the DevKit's "UART" port on some boards)
+    OTHER = "other"
+
+
 @dataclass
 class PortCandidate:
     device: str
     description: str
     vid: int | None
     pid: int | None
-    is_wch: bool
+    kind: PortKind
+
+    @property
+    def is_adapter(self) -> bool:
+        return self.kind is not PortKind.OTHER
 
 
 class PortSelectionError(RuntimeError):
     pass
+
+
+def port_kind(vid: int | None, product: str) -> PortKind:
+    if vid == ESP32_USB_VID and BRIDGE_PRODUCT in product:
+        return PortKind.BRIDGE
+    if vid == WCH_USB_VID:
+        return PortKind.WCH
+    return PortKind.OTHER
 
 
 def discover_ports() -> list[PortCandidate]:
@@ -82,23 +102,24 @@ def discover_ports() -> list[PortCandidate]:
             description=port.description or "",
             vid=port.vid,
             pid=port.pid,
-            is_wch=port.vid == WCH_USB_VID,
+            kind=port_kind(port.vid, f"{port.product or ''} {port.description or ''}"),
         )
-    return sorted(candidates.values(), key=lambda c: (not c.is_wch, c.device))
+    return sorted(candidates.values(), key=lambda c: (not c.is_adapter, c.device))
 
 
 def select_port(candidates: list[PortCandidate], explicit: str | None) -> str:
+    """The only bus adapter (ESP32 bridge or URT-2 USB); never guesses between several."""
     if explicit:
         return explicit
-    pool = [c for c in candidates if c.is_wch] or candidates
+    pool = [c for c in candidates if c.is_adapter] or candidates
     if len(pool) == 1:
         return pool[0].device
     if not pool:
         raise PortSelectionError(
-            "No USB serial adapter found. Check the URT-2 USB cable and that the "
+            "No USB serial adapter found. Check the USB cable (URT-2 or ESP32 bridge) and that the "
             "USB-serial driver is loaded (`dexhand-servo list-ports`)."
         )
-    names = ", ".join(c.device for c in pool)
+    names = ", ".join(f"{c.device} ({c.kind.value})" for c in pool)
     raise PortSelectionError(f"Several candidate ports ({names}); pass --port explicitly.")
 
 
@@ -235,7 +256,13 @@ class LinkAssessment:
         return max(self.positions) - min(self.positions) if self.positions else None
 
 
-def assess_link(bus: SafeBus, servo_id: int, cfg: BringupConfig, read_trials: int | None = None) -> LinkAssessment:
+def assess_link(
+    bus: SafeBus,
+    servo_id: int,
+    cfg: BringupConfig,
+    read_trials: int | None = None,
+    model: ServoModel = SCS0009,
+) -> LinkAssessment:
     ping_txns: list[Transaction] = []
     read_txns: list[Transaction] = []
     corrupt = 0
@@ -258,8 +285,8 @@ def assess_link(bus: SafeBus, servo_id: int, cfg: BringupConfig, read_trials: in
         t = bus.read(servo_id, PRESENT_BLOCK_ADDR, PRESENT_BLOCK_LEN)
         read_txns.append(t)
         if t.ok and len(t.data) == PRESENT_BLOCK_LEN:
-            last_present = decode(t.data, base_addr=PRESENT_BLOCK_ADDR)
-            positions.append(int(last_present["present_position"].raw))
+            last_present = model.decode(t.data, base_addr=PRESENT_BLOCK_ADDR)
+            positions.append(int(last_present["present_position"].value))
         if note(t):
             break
 
@@ -330,32 +357,99 @@ def assess_link(bus: SafeBus, servo_id: int, cfg: BringupConfig, read_trials: in
 # ---------------------------------------------------------------- S5: register dump + checks
 
 
+def read_identity(bus: SafeBus, servo_id: int) -> tuple[ServoModel | None, list[int] | None]:
+    """(model, registers 0..4); the model is None for an unsupported servo, both are None without a clean reply."""
+    t = bus.read(servo_id, 0, IDENTITY_LEN)
+    if not (t.ok and len(t.data) == IDENTITY_LEN):
+        return None, None
+    return identify(t.data), list(t.data)
+
+
+class CensusError(RuntimeError):
+    """The bus census could not be completed; writes stay refused."""
+
+
+CENSUS_READ_LEN = 8  # registers 0..7: identity plus the HLS secondary ID
+
+
+def take_census(bus: SafeBus, ids: Iterable[int] | None = None, retries: int = 1) -> Census:
+    """Find every HLS secondary ID on the bus and store the result in `bus.census`.
+
+    PINGs every ID (0..253 by default) and reads registers 0..7 of each responder. Fails,
+    leaving `bus.census` unchanged, when a responder cannot be read cleanly or is not a
+    supported model: its secondary IDs would then be unknown. Transactions are not kept
+    in `bus.history`.
+    """
+    secondaries: dict[int, set[int]] = {}
+    keep_history = bus.keep_history
+    bus.keep_history = False
+    try:
+        for servo_id in range(MAX_SERVO_ID + 1) if ids is None else ids:
+            if all(bus.ping(servo_id).result is CommResult.TIMEOUT for _ in range(retries + 1)):
+                continue
+            t = bus.read(servo_id, 0, CENSUS_READ_LEN)
+            if not (t.ok and len(t.data) == CENSUS_READ_LEN):
+                raise CensusError(f"ID {servo_id} answers PING but registers 0..7 do not read cleanly "
+                                  f"({t.result.value}; several servos on one ID?); its secondary ID is unknown")
+            model = identify(t.data)
+            if model is None:
+                raise CensusError(f"ID {servo_id} is an unsupported servo (registers 0..4 = {t.data[:5]}); "
+                                  "whether it answers other IDs is unknown")
+            if model.reg_secondary_id is not None:
+                secondaries.setdefault(t.data[model.reg_secondary_id], set()).add(servo_id)
+    finally:
+        bus.keep_history = keep_history
+    census = {secondary: frozenset(primaries) for secondary, primaries in secondaries.items()}
+    bus.census = census
+    return census
+
+
+def ensure_census(bus: SafeBus) -> Census:
+    return bus.census if bus.census is not None else take_census(bus)
+
+
 @dataclass
 class RegisterDump:
     servo_id: int
     raw: list[int | None]
     failed_chunks: list[tuple[int, int, str]]
     decoded: dict[str, DecodedValue]
+    model: ServoModel | None = None
 
 
 def dump_registers(bus: SafeBus, servo_id: int, chunk: int = 16) -> RegisterDump:
+    """Read the whole memory table of one servo; the model is identified from the first chunk.
+
+    An unidentified servo gets the SCS0009 range (0..70) as a raw dump with nothing decoded.
+    """
     raw: list[int | None] = [None] * DUMP_END
     failed: list[tuple[int, int, str]] = []
-    for start in range(0, DUMP_END, chunk):
-        length = min(chunk, DUMP_END - start)
+    model: ServoModel | None = None
+    end = DUMP_END
+    start = 0
+    while start < end:
+        length = min(chunk, end - start)
         t = bus.read(servo_id, start, length)
         if t.ok and len(t.data) == length:
             raw[start : start + length] = t.data
         else:
             failed.append((start, length, t.result.value))
-    return RegisterDump(servo_id, raw, failed, decode(raw))
+        if start == 0:
+            model = identify(raw[:IDENTITY_LEN])
+            if model is not None and model.dump_end != end:
+                end = model.dump_end
+                raw = (raw + [None] * end)[:end]
+        start += length
+    return RegisterDump(servo_id, raw, failed, model.decode(raw) if model else {}, model)
 
 
 def run_checks(
     dump: RegisterDump, assessment: LinkAssessment, baudrate: int, cfg: BringupConfig
 ) -> list[Check]:
     d = dump.decoded
+    model = dump.model
     checks: list[Check] = []
+    joint = cfg.joints.get(dump.servo_id)
 
     def add(name: str, ok: bool, pass_detail: str, fail_detail: str, severity: Severity = Severity.WARN) -> None:
         checks.append(Check(name, Severity.PASS if ok else severity, pass_detail if ok else fail_detail))
@@ -367,9 +461,20 @@ def run_checks(
         spans = ", ".join(f"{s}..{s + n - 1} ({r})" for s, n, r in dump.failed_chunks)
         checks.append(Check("register dump", Severity.WARN, f"unreadable spans: {spans}"))
 
-    end_flag = value("end_flag")
-    add("byte order", end_flag == 1, "END=1 (big-endian, as assumed)",
-        f"END register reads {end_flag}; big-endian decoding is unconfirmed")
+    if model is None:
+        identity = dump.raw[:IDENTITY_LEN]
+        checks.append(Check("servo model", Severity.WARN,
+                            f"unsupported servo (registers 0..4 = {identity}); raw dump only, nothing decoded"))
+        add("status packet error byte", not assessment.error_bytes, "always 0",
+            f"non-zero error bytes seen: {[hex(e) for e in assessment.error_bytes]}")
+        return checks
+
+    identity = f"{model.label} (END={model.end_flag}, {model.byteorder}-endian)"
+    if joint is None:
+        add("servo model", True, identity, "")
+    else:
+        add("servo model", joint.model == model.key, f"{identity}, as configured for {joint.name}",
+            f"servo is {identity} but config.py JOINTS says {joint.model} for {joint.name}", Severity.FAIL)
 
     servo_id = value("id")
     add("id register", servo_id == dump.servo_id, f"ID register = {servo_id}",
@@ -393,12 +498,17 @@ def run_checks(
         f"torque_enable = {torque}; left unchanged by this tool")
 
     position, lower, upper = value("present_position"), value("min_angle_limit"), value("max_angle_limit")
-    add("within EEPROM angle limits",
-        None not in (position, lower, upper) and lower <= position <= upper,
-        f"{position} in [{lower}, {upper}]",
-        f"{position} vs limits [{lower}, {upper}]")
+    multi_turn = model.is_hls and lower == 0 and upper == 0
+    if multi_turn:
+        add("servo angle limits", False, "",
+            "0/0: multi-turn mode, the servo does not limit travel itself; measure the joint, then write its "
+            "travel with `hls-setup --limits-from-config` (README, HLS bring-up)")
+    else:
+        add("within EEPROM angle limits",
+            None not in (position, lower, upper) and lower <= position <= upper,
+            f"{position} in [{lower}, {upper}]",
+            f"{position} vs limits [{lower}, {upper}]")
 
-    joint = cfg.joints.get(dump.servo_id)
     if joint is not None and joint.has_travel_limits:
         travel_lo, travel_hi = joint.min_position, joint.max_position
         add("within joint travel",
@@ -406,16 +516,36 @@ def run_checks(
             f"{position} in configured [{travel_lo}, {travel_hi}] ({joint.name})",
             f"{position} outside configured [{travel_lo}, {travel_hi}] for {joint.name}: "
             "check the limits, the ID-to-joint mapping, or the joint assembly")
-        add("travel inside EEPROM limits",
-            None not in (lower, upper) and lower <= travel_lo and travel_hi <= upper,
-            f"[{travel_lo}, {travel_hi}] inside [{lower}, {upper}]",
-            f"configured [{travel_lo}, {travel_hi}] exceeds the servo's angle limits [{lower}, {upper}]")
+        if not multi_turn:
+            add("travel inside EEPROM limits",
+                None not in (lower, upper) and lower <= travel_lo and travel_hi <= upper,
+                f"[{travel_lo}, {travel_hi}] inside [{lower}, {upper}]",
+                f"configured [{travel_lo}, {travel_hi}] exceeds the servo's angle limits [{lower}, {upper}]")
+
+    if model.is_hls:
+        mode = value("mode")
+        add("operating mode", mode == 0, "0 = position servo",
+            f"mode = {mode}; only position-servo mode 0 is supported (motion is refused)")
+        resolution = value("angle_resolution")
+        add("angle resolution", resolution == 1, "1 (4096 steps per turn)",
+            f"angle resolution = {resolution}; step sizes assume 1 (motion is refused)")
+        offset = value("position_offset")
+        expected = joint.position_offset if joint is not None else 0
+        add("position offset", offset == expected, f"{offset} steps",
+            f"{offset} steps, config expects {expected}: travel limits measured with another offset "
+            "do not match this servo (motion is refused)")
+        if position is not None and position < 0:
+            checks.append(Check("position sign", Severity.WARN,
+                                f"present position {position} is negative (full-angle feedback crossed the zero "
+                                "seam); power-cycle the servo with the joint inside its travel"))
 
     spread = assessment.position_spread
-    add("position stability", spread is not None and spread <= cfg.position_spread_max,
+    spread_max = model.scs_steps(cfg.position_spread_max)
+    sensor = "encoder noise" if model.is_hls else "potentiometer noise"
+    add("position stability", spread is not None and spread <= spread_max,
         f"spread {spread} steps over {len(assessment.positions)} reads",
         f"spread {spread} steps over {len(assessment.positions)} reads with torque off: "
-        "potentiometer noise, supply ripple, or the joint being back-driven (tendon / return spring)")
+        f"{sensor}, supply ripple, or the joint being back-driven (tendon / return spring)")
 
     status = value("status")
     add("status register", status == 0, "0", f"status = 0x{(status or 0):02X}")
@@ -426,6 +556,22 @@ def run_checks(
     moving = value("moving")
     add("moving flag", moving == 0, "stationary", f"moving = {moving} although nothing was commanded")
     return checks
+
+
+def secondary_id_collisions(report_servos: list[ServoReport], joint_ids: set[int]) -> list[str]:
+    """HLS servos whose secondary ID equals another servo's or joint's ID: a WRITE meant for that ID reaches both."""
+    present = {s.assessment.servo_id for s in report_servos}
+    problems = []
+    for servo in report_servos:
+        dump = servo.dump
+        if dump is None or dump.model is None or "secondary_id" not in dump.decoded:
+            continue
+        secondary = int(dump.decoded["secondary_id"].value)
+        if secondary != dump.servo_id and secondary in present | joint_ids:
+            role = "a responding servo" if secondary in present else "a configured joint"
+            problems.append(f"ID {dump.servo_id} has secondary ID {secondary}, which is also {role}: "
+                            f"a WRITE meant for ID {secondary} would also reach ID {dump.servo_id}")
+    return problems
 
 
 # ---------------------------------------------------------------- orchestration
@@ -500,7 +646,8 @@ def run_diagnose(
         return report
 
     for index, entry in enumerate(responders):
-        servo = ServoReport(assess_link(bus, entry.servo_id, cfg))
+        model, _ = read_identity(bus, entry.servo_id)
+        servo = ServoReport(assess_link(bus, entry.servo_id, cfg, model=model or SCS0009))
         if servo.assessment.verdict is Verdict.HEALTHY_SINGLE:
             servo.dump = dump_registers(bus, entry.servo_id)
             servo.checks = run_checks(servo.dump, servo.assessment, bus.baudrate, cfg)
@@ -508,11 +655,8 @@ def run_diagnose(
         if progress:
             progress("assess", index + 1, len(responders))
 
-    models = {
-        s.dump.decoded["model_number"].raw for s in report.servos if s.dump and "model_number" in s.dump.decoded
-    }
-    if len(models) > 1:
-        report.fleet_checks.append(Check("model consistency", Severity.WARN, f"mixed model numbers {sorted(models)}"))
+    for problem in secondary_id_collisions(report.servos, set(cfg.joints)):
+        report.fleet_checks.append(Check("secondary ID", Severity.FAIL, problem))
     healthy_ids = {s.assessment.servo_id for s in report.servos if s.assessment.verdict is Verdict.HEALTHY_SINGLE}
     missing = [i for i in cfg.expected_ids if i in ids and i not in healthy_ids]
     if missing:

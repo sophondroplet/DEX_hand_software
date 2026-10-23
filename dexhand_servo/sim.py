@@ -1,4 +1,4 @@
-"""Simulated SCS0009 servos behind a fake pyserial object.
+"""Simulated SCS0009 and HLS3606 servos behind a fake pyserial object.
 
 Plugs into `SafeBus(serial_factory=...)`, so the real SDK packet handling, guard
 and traffic logging are exercised. Used by the test-suite and by
@@ -8,9 +8,12 @@ and traffic logging are exercised. Used by the test-suite and by
   idle-high line pulled low by any driver), so identical PING replies stay clean
   while READ replies with differing positions come out corrupt - the same failure
   signature as on real hardware.
-- With torque on, a servo moves toward its goal at the goal-speed register value
-  (steps/s; 0 = maximum) on the bus clock. With torque off the goal register
-  mirrors the present position, as observed on the real SCS0009.
+- With torque on, a servo moves toward its goal at the goal-speed register value on the
+  bus clock: SCS0009 steps/s with 0 = maximum; HLS3606 0.732 RPM units with 0 = stop.
+  With torque off the SCS0009 goal register mirrors the present position, as observed on
+  the real servo; the HLS3606 goal register keeps its last value (also observed).
+- Registers use the model's byte order and memory map. An HLS3606 also applies WRITE and
+  SYNC_WRITE packets addressed to its secondary ID (register 7), without replying.
 - Faults can be injected per servo (load, blocked joint, error byte, dropped
   replies, voltage, temperature) and per bus (unpowered, echo, write exception).
 """
@@ -25,6 +28,7 @@ from dataclasses import dataclass, field
 import serial
 
 from .config import JOINTS
+from .models import HLS3606, MODELS, SCS0009, ServoModel
 
 INST_PING, INST_READ, INST_WRITE, INST_SYNC_WRITE = 0x01, 0x02, 0x03, 0x83
 REG_TORQUE, REG_GOAL, REG_SPEED, REG_POSITION = 40, 42, 46, 56
@@ -50,6 +54,13 @@ def _word(regs: bytearray, addr: int) -> int:
 class FakeServo:
     servo_id: int
     position: float = 512
+    model: ServoModel = SCS0009
+    secondary_id: int = 0  # HLS3606 register 7 (factory default 0)
+    angle_limits: tuple[int, int] | None = None  # EEPROM 9/11; default per model
+    # HLS3606 position offset (register 31): reported position changes by offset_sign x the
+    # offset change, immediately when offset_live (the real sign and timing are undocumented).
+    offset_sign: int = -1
+    offset_live: bool = True
     voltage_dv: int = 60
     temperature: int = 28
     baud_code: int = 0
@@ -68,19 +79,34 @@ class FakeServo:
 
     def __post_init__(self) -> None:
         r = self.regs
-        r[0], r[1], r[2] = 3, 6, 1  # firmware, END=1
-        r[3], r[4] = 0x05, 0x09  # model number (placeholder)
         r[5] = self.servo_id
         r[6] = self.baud_code
         r[8] = 1
-        self._set_word(9, 20)
-        self._set_word(11, 1003)
-        r[13], r[14], r[15] = 70, 80, 40
-        r[21], r[22] = 15, 15  # P / D gain, factory values seen on the real SCS0009
-        self._set_word(16, 1000)
         r[REG_TORQUE] = self.torque_enable
+        if self.model is HLS3606:
+            lo, hi = self.angle_limits or (0, 4095)  # manual defaults; 0/0 would be multi-turn
+            r[0], r[1], r[2], r[3], r[4] = 3, 43, 0, 10, 10  # values read from a real HLS3606
+            r[7] = self.secondary_id
+            r[13], r[14], r[15] = 70, 100, 40
+            r[19] = 13
+            r[21], r[22], r[24] = 32, 32, 24
+            r[30] = 1  # angle resolution
+            self._set_word(28, 800)  # protection current, 6.5 mA units
+            self._set_word(44, 800)  # goal current starts at the protection current
+            self._set_word(REG_SPEED, 250)
+            self._set_word(48, 1000)  # torque limit
+            r[50], r[51] = 32, 32
+            r[55] = 1
+        else:
+            lo, hi = self.angle_limits or (20, 1003)
+            r[0], r[1], r[2] = 3, 6, 1  # firmware, END=1
+            r[3], r[4] = 0x05, 0x09  # model number (placeholder)
+            r[21], r[22] = 15, 15  # P / D gain, factory values seen on the real SCS0009
+            r[48] = 1
+        self._set_word(9, lo)
+        self._set_word(11, hi)
+        self._set_word(16, 1000)
         self._set_word(REG_GOAL, round(self.position))
-        r[48] = 1
 
     @property
     def current_id(self) -> int:
@@ -92,11 +118,29 @@ class FakeServo:
 
     @property
     def goal(self) -> int:
-        return _word(self.regs, REG_GOAL)
+        return self.word(REG_GOAL)
+
+    def word(self, addr: int) -> int:
+        return self.model.word(self.regs[addr], self.regs[addr + 1])
 
     def _set_word(self, addr: int, value: int) -> None:
-        self.regs[addr] = (value >> 8) & 0xFF
-        self.regs[addr + 1] = value & 0xFF
+        self.regs[addr : addr + 2] = self.model.encode_word(value)
+
+    def _offset(self) -> int:
+        raw = self.word(31)
+        return -(raw & 0x7FFF) if raw & 0x8000 else raw
+
+    def _speed(self) -> float:
+        raw = self.word(REG_SPEED)
+        if self.model is HLS3606:
+            return self.model.steps_per_s(raw & 0x7FFF)  # 0 = stop
+        return raw or SIM_MAX_SPEED
+
+    def addressed_by(self, servo_id: int, instruction: int) -> bool:
+        if self.current_id == servo_id:
+            return True
+        return (self.model.reg_secondary_id is not None and instruction in (INST_WRITE, INST_SYNC_WRITE)
+                and self.regs[self.model.reg_secondary_id] == servo_id)
 
     def update(self, now: float) -> None:
         dt = 0.0 if self._last_update is None else max(0.0, now - self._last_update)
@@ -110,20 +154,26 @@ class FakeServo:
                 if self.blocked:
                     load = direction * self.blocked_load_pct
                 else:
-                    speed = _word(self.regs, REG_SPEED) or SIM_MAX_SPEED
-                    step = min(abs(error), speed * dt)
+                    step = min(abs(error), self._speed() * dt)
                     self.position += direction * step
                     moving = int(step > 0)
                     load = direction * self.load_pct
             else:
                 load = self.load_pct
         else:
-            self._set_word(REG_GOAL, round(self.position))
+            if self.model is not HLS3606:
+                self._set_word(REG_GOAL, round(self.position))
             load = self.load_pct if self.blocked else 0.0
         raw_load = min(1000, round(abs(load) * 10)) | (0x400 if load < 0 else 0)
         self._set_word(60, raw_load)
         self.regs[62], self.regs[63] = self.voltage_dv, self.temperature
         self.regs[66] = moving
+        if self.model is HLS3606:
+            self._set_word(67, self.goal)
+            # Phase current roughly follows the drive duty, up to the goal-current limit.
+            limit = self.word(44) & 0x7FFF
+            current = min(limit, round(abs(load) / 100 * self.word(28)))
+            self._set_word(69, current | (0x8000 if load < 0 else 0))
 
     def respond(self, instruction: int, params: bytes, rng: random.Random, now: float) -> bytes | None:
         self.update(now)
@@ -137,7 +187,10 @@ class FakeServo:
         if instruction == INST_READ:
             address, length = params[0], params[1]
             noisy = round(self.position) + rng.randint(-self.position_noise, self.position_noise)
-            self._set_word(REG_POSITION, max(0, min(1023, noisy)))
+            if self.model.position_sign_bit is not None and noisy < 0:
+                self._set_word(REG_POSITION, min(-noisy, 0x7FFF) | (1 << self.model.position_sign_bit))
+            else:
+                self._set_word(REG_POSITION, max(0, min(self.model.position_max, noisy)))
             return status_frame(self.current_id, self.error_byte, bytes(self.regs[address : address + length]))
         if instruction == INST_WRITE:
             old_id = self.current_id
@@ -148,7 +201,10 @@ class FakeServo:
         return status_frame(self.current_id, 0)
 
     def _apply_write(self, address: int, data: bytes) -> None:
+        offset_before = self._offset()
         self.regs[address : address + len(data)] = data
+        if self.model is HLS3606 and self.offset_live:
+            self.position += self.offset_sign * (self._offset() - offset_before)
         if self.implicit_torque_on_goal and address <= REG_GOAL < address + len(data):
             self.regs[REG_TORQUE] = 1
 
@@ -218,10 +274,16 @@ class FakeBus:
             for i in range(0, len(payload), data_len + 1):
                 target, data = payload[i], payload[i + 1 : i + 1 + data_len]
                 for s in self.servos:
-                    if s.current_id == target and baudrate == _BAUDS[s.baud_code]:
+                    if s.addressed_by(target, INST_SYNC_WRITE) and baudrate == _BAUDS[s.baud_code]:
                         s.update(now)
                         s._apply_write(start, bytes(data))
             return b""
+        for s in self.servos:
+            # A WRITE addressed to an HLS secondary ID is applied without a reply.
+            if (instruction == INST_WRITE and s.current_id != servo_id and s.addressed_by(servo_id, instruction)
+                    and baudrate == _BAUDS[s.baud_code]):
+                s.update(now)
+                s._apply_write(params[0], bytes(params[1:]))
         frames = [
             frame
             for s in self.servos
@@ -281,6 +343,8 @@ def simulated_hand(seed: int = 7) -> FakeBus:
     for servo_id, joint in JOINTS.items():
         lo = joint.min_position if joint.min_position is not None else 400
         hi = joint.max_position if joint.max_position is not None else 600
+        model = MODELS[getattr(joint, "model", SCS0009.key)]
         servos.append(FakeServo(servo_id, position=rng.uniform(lo + 0.3 * (hi - lo), hi - 0.3 * (hi - lo)),
+                                model=model, angle_limits=(lo, hi) if model is HLS3606 else None,
                                 temperature=rng.randint(24, 30), load_pct=3.0))
     return FakeBus(servos, seed=seed)

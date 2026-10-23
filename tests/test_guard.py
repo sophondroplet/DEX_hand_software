@@ -110,3 +110,82 @@ def test_write_byte_refused_outside_id_mode_and_for_other_registers(open_bus) ->
         bus.write_byte(1, 40, 1)
     assert bus.policy is READ_ONLY
     assert fake.writes() == []
+
+
+class _AllowAll(READ_ONLY.__class__):
+    """Lets every WRITE / SYNC_WRITE through the policy layer, so only the census check decides."""
+
+    def __init__(self) -> None:
+        super().__init__("allow-all", frozenset(range(256)))
+
+    def check_write(self, packet) -> None:
+        pass
+
+    def check_sync_write(self, packet) -> None:
+        pass
+
+
+def _bus_with(open_bus, census):
+    from fake_bus import FakeBus, FakeServo
+
+    from dexhand_servo.models import HLS3606
+
+    fake = FakeBus([FakeServo(1), FakeServo(7, position=2000, model=HLS3606, secondary_id=5)])
+    bus = open_bus(fake)
+    bus.census = census
+    bus.set_policy(_AllowAll())
+    return fake, bus
+
+
+def test_no_census_refuses_every_write_except_torque_off(open_bus) -> None:
+    fake, bus = _bus_with(open_bus, None)
+    for attempt in (lambda: bus.write_byte(1, 5, 3), lambda: bus.write_byte(1, 40, 1),
+                    lambda: bus.sync_write(42, 6, {1: bytes(6)})):
+        with pytest.raises(UnsafeOperationError, match="no bus census"):
+            attempt()
+    assert bus.write_byte(1, 40, 0).ok
+    bus.sync_write(40, 1, {1: b"\x00", 7: b"\x00"})
+    assert fake.writes() == [(1, 40, 0)] and len(fake.sync_writes()) == 1
+
+
+def test_writes_to_a_secondary_id_are_refused_but_torque_off_passes(open_bus) -> None:
+    fake, bus = _bus_with(open_bus, {5: frozenset({7})})
+    with pytest.raises(UnsafeOperationError, match="secondary ID of HLS servo"):
+        bus.write_byte(5, 41, 0)
+    with pytest.raises(UnsafeOperationError, match="secondary ID of HLS servo"):
+        bus.sync_write(42, 6, {1: bytes(6), 5: bytes(6)})
+    bus.write_byte(7, 41, 0)  # the HLS itself, by its primary ID
+    bus.write_byte(5, 40, 0)  # torque-off is always allowed (E-stop)
+    bus.sync_write(40, 1, {5: b"\x00", 1: b"\x00"})
+    assert [w[:2] for w in fake.writes()] == [(7, 41), (5, 40)]
+    assert fake.servo(7).torque == 0
+
+
+def test_census_finds_secondary_ids_and_fails_closed(open_bus) -> None:
+    from fake_bus import FakeBus, FakeServo
+
+    from dexhand_servo.diagnostics import CensusError, take_census
+    from dexhand_servo.models import HLS3606
+
+    hls = [FakeServo(3, position=2000, model=HLS3606, secondary_id=0),
+           FakeServo(4, position=2000, model=HLS3606, secondary_id=0),
+           FakeServo(9, position=2000, model=HLS3606, secondary_id=9)]
+    bus = open_bus(FakeBus([FakeServo(1), *hls]))
+    assert take_census(bus, ids=range(12)) == {0: frozenset({3, 4}), 9: frozenset({9})}
+    assert bus.history == [], "census traffic is not kept"
+
+    odd = FakeServo(2)
+    odd.regs[2] = 7  # unsupported model
+    bus = open_bus(FakeBus([odd]))
+    bus.census = None
+    with pytest.raises(CensusError, match="unsupported"):
+        take_census(bus, ids=range(4))
+    assert bus.census is None
+
+    twins = [FakeServo(1, position=2000, model=HLS3606, secondary_id=0),
+             FakeServo(1, position=2000, model=HLS3606, secondary_id=8)]
+    bus = open_bus(FakeBus(twins))
+    bus.census = None
+    with pytest.raises(CensusError, match="several servos"):
+        take_census(bus, ids=range(3))
+    assert bus.census is None

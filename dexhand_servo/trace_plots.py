@@ -112,7 +112,9 @@ footer { color: var(--text-muted); font-size: 12px; }
     `Position and goal register are read at the start of each cycle, so they trail the setpoint sent in the same row ` +
     `by one cycle. Max goal step = largest change of the sent goal between two cycles (stair height); stalled cycles = ` +
     `cycles where the goal advanced by >= 1 step but the measured position did not change. ` +
-    `Per-sample data: ${data.csv_name}. Load is % of max torque (SCS0009 has no usable current reading).`;
+    `Per-sample data: ${data.csv_name}. Positions are in each joint's own servo steps ` +
+    `(SCS0009 ~0.29 deg, HLS3606 ~0.09 deg; arrival tolerance scaled to the same angle). ` +
+    `Load is the drive duty in % of maximum.`;
 
   const summary = document.getElementById("summary");
   const arrivals = data.joints.map((j) => j.summary.arrival_s).filter((v) => v !== null);
@@ -187,7 +189,7 @@ footer { color: var(--text-muted); font-size: 12px; }
     const charts = el("div", { class: "charts" });
     const mk = (title) => { const w = el("div"); w.appendChild(el("p", { class: "chart-title" }, title));
       const s = svgEl("svg", { class: "chart", tabindex: "0", role: "img", "aria-label": `${title}, ID ${j.id}` }); w.appendChild(s); charts.appendChild(w); return s; };
-    const posSvg = mk("Position (steps): setpoint vs actual"), loadSvg = mk("Load (% of max torque)");
+    const posSvg = mk("Position (steps): setpoint vs actual"), loadSvg = mk("Load (% drive duty)");
     const tip = el("div", { class: "tooltip" }); charts.appendChild(tip);
     card.appendChild(charts); host.appendChild(card);
     rows.push({ j, posSvg, loadSvg, tip, charts });

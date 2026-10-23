@@ -11,6 +11,7 @@ JOINT = JointConfig("test", 300, 700)
 
 def run(fake, answers=None, **kwargs):
     bus = SafeBus("/dev/fake", 1_000_000, latency_ms=2, serial_factory=fake.serial_factory)
+    bus.census = {}  # census taken: no HLS secondary IDs
     bus.open()
     replies = iter(answers or [])
     ask = lambda prompt: next(replies, "y")
@@ -61,6 +62,7 @@ def test_cli_prompt_shows_the_answer_options(monkeypatch, tmp_path) -> None:
     middle = (CONFIGURED[2].min_position + CONFIGURED[2].max_position) // 2
     fake = FakeBus([FakeServo(2, position=middle, position_noise=0)])
     bus = SafeBus("/dev/fake", 1_000_000, latency_ms=2, serial_factory=fake.serial_factory)
+    bus.census = {}  # census taken: no HLS secondary IDs
     bus.open()
     out = io.StringIO()
     monkeypatch.setattr(cli, "console", Console(file=out, width=200))

@@ -33,8 +33,10 @@ def cfg() -> BringupConfig:
 def open_bus():
     buses: list[SafeBus] = []
 
-    def factory(fake: FakeBus, baudrate: int = 1_000_000) -> SafeBus:
+    def factory(fake: FakeBus, baudrate: int = 1_000_000, census: dict | None = None) -> SafeBus:
+        """`census` defaults to "taken, no HLS secondary IDs"; pass e.g. `take_census` results explicitly."""
         bus = SafeBus("/dev/fake", baudrate, latency_ms=TEST_LATENCY_MS, serial_factory=fake.serial_factory)
+        bus.census = {} if census is None else census
         bus.open()
         buses.append(bus)
         return bus

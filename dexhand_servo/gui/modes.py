@@ -233,7 +233,8 @@ class JogPage(ModePage):
             button.clicked.connect(lambda _=False, s=sign: self._jog(s))
         layout = QVBoxLayout(self)
         layout.addWidget(_hint("Nudge one armed joint in small steps (hold a button to repeat). "
-                               "Useful for checking travel ends and calibration."))
+                               "Useful for checking travel ends and calibration. Steps are SCS0009 steps "
+                               "(~0.29°); HLS3606 joints move the same angle."))
         layout.addWidget(self.joint)
         layout.addLayout(steps_row)
         row = QHBoxLayout()

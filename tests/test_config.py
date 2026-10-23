@@ -49,3 +49,28 @@ def test_stream_speed_register() -> None:
                      stream_speed_register=1000)
     assert [m.stream_speed(v) for v in (0, 30, 100, -200, 5000)] == [50, 50, 130, 260, 1000]
     assert replace(m, stream_speed_mode="fixed").stream_speed(10) == 1000
+
+
+@pytest.mark.parametrize(
+    "joint,fragment",
+    [
+        (JointConfig("a", model="sts3215"), "unknown model"),
+        (JointConfig("a", min_position=100, max_position=1024), "1023"),
+        (JointConfig("a", min_position=100, max_position=4096, model="hls3606"), "4095"),
+        (JointConfig("a", max_speed=1001), "1..1000"),
+        (JointConfig("a", current_limit_ma=500), "HLS servos only"),
+        (JointConfig("a", position_offset=10), "HLS servos only"),
+        (JointConfig("a", model="hls3606", current_limit_ma=5), "current_limit_ma"),
+        (JointConfig("a", model="hls3606", position_offset=5000), "position_offset"),
+    ],
+)
+def test_per_model_limits(joint, fragment: str) -> None:
+    problems = validate_joints({1: joint})
+    assert len(problems) == 1 and fragment in problems[0], problems
+
+
+def test_hls_joint_uses_its_own_ranges() -> None:
+    joint = JointConfig("a", min_position=1500, max_position=3000, max_speed=2000, model="hls3606",
+                        current_limit_ma=1200, position_offset=-300)
+    assert validate_joints({1: joint}) == []
+    assert joint.servo_model.label == "HLS3606"

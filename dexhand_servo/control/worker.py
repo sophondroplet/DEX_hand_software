@@ -3,7 +3,7 @@
 Cycle (default 50 Hz):
   1. service E-stop            (also checked before every single transaction)
   2. apply queued commands     (arm/disarm, mode, moves, recording, ...)
-  3. read registers 40..66 of every joint (also confirms the previous SYNC_WRITE)
+  3. read the status block of every joint (40..66, HLS 40..70; also confirms the previous SYNC_WRITE)
   4. safety supervisor -> trips (torque off + latched fault)
   5. advance motion            (plan / slider / jog targets -> per-joint RateLimiter)
   6. one SYNC_WRITE of setpoints, only to armed joints whose torque was just read as on
@@ -13,6 +13,16 @@ Cycle (default 50 Hz):
 Reading before writing matters: if a goal write implicitly re-enables torque on
 this firmware, writing first would silently undo a servo's own overload cut-out
 before the supervisor could see it.
+
+Joints may use different servo models: positions and speeds stay in each joint's own
+units, MotionConfig step values (SCS0009 units) are converted per joint, and every
+goal block is encoded by the policy for its joint's model.
+
+Joints that do not reply at startup are OFFLINE: they are not polled, not supervised, not
+counted in torque-off confirmation and cannot be armed, so the GUI stays usable with an
+incomplete servo set. `RescanBus` (only while nothing is armed) refreshes the online set and
+the HLS secondary-ID census. A joint that drops out after being online is still treated as a
+communication loss by the supervisor.
 
 The GUI only calls the thread-safe methods: estop, submit, set_target, heartbeat,
 snapshot, drain_events, take_recording, start, stop.
@@ -31,10 +41,11 @@ from enum import Enum
 from pathlib import Path
 
 from ..config import JointConfig, MotionConfig
+from ..diagnostics import CensusError, ensure_census
 from ..registers import REG_TORQUE_ENABLE
 from ..safe_bus import SafeBus, UnsafeOperationError
 from .arming import arm_joint, disarm_joint, read_status
-from .policy import GOAL_BLOCK_LEN, REG_GOAL_BLOCK, MotionPolicy, goal_block, limits_from_config
+from .policy import GOAL_BLOCK_LEN, REG_GOAL_BLOCK, MotionPolicy, limits_from_config
 from .snapshot import Event, HandSnapshot, JointState, ServoReading
 from .supervisor import JointInput, Supervisor, SupervisorResult, Trip
 from .trace import TraceRecorder, trace_payload, write_trace_csv
@@ -117,6 +128,11 @@ class StopMotion:
     pass
 
 
+@dataclass(frozen=True)
+class RescanBus:
+    pass
+
+
 @dataclass
 class SingleWriteMove:
     """A pose sent as one SYNC_WRITE. The bus write happens in the cycle's send phase, after the read."""
@@ -131,7 +147,7 @@ class SingleWriteMove:
 
 
 Command = (ArmJoints | DisarmJoints | ResetFaults | SetMode | MoveTo | Jog | StartRecording | StopRecording
-           | Playback | StopMotion)
+           | Playback | StopMotion | RescanBus)
 
 
 class Controller:
@@ -151,7 +167,9 @@ class Controller:
         self.motion = motion
         if motion.stream_speed_mode not in ("dynamic", "fixed"):
             raise ValueError(f"stream_speed_mode must be 'dynamic' or 'fixed', got {motion.stream_speed_mode!r}")
-        self.policy = MotionPolicy(limits_from_config(self.joints, motion), known_ids=list(self.joints))
+        self._models = {i: joint.servo_model for i, joint in self.joints.items()}
+        self.policy = MotionPolicy(limits_from_config(self.joints, motion), known_ids=list(self.joints),
+                                   models=self._models)
         bus.set_policy(self.policy)
         bus.keep_history = False
         self._clock = clock
@@ -174,7 +192,7 @@ class Controller:
 
         # Worker-thread state.
         self.mode = Mode.SLIDER
-        self._supervisor = Supervisor(motion)
+        self._supervisor = Supervisor(motion, scales={i: m.step_scale for i, m in self._models.items()})
         self._last_result = SupervisorResult()
         self._limiters: dict[int, RateLimiter] = {}
         self._plan: MotionPlan | None = None
@@ -185,6 +203,8 @@ class Controller:
         self._fail_counts: dict[int, int] = dict.fromkeys(self.joints, 0)
         self._last_ok: dict[int, float | None] = dict.fromkeys(self.joints)
         self._joint_faults: dict[int, str] = {}
+        self._online: set[int] = set(self.joints)  # decided in startup(), refreshed by RescanBus
+        self._torque_off_replies: dict[int, ServoReading | None] = {}
         self._global_faults: list[str] = []
         self._estop_latched = False
         self._estop_confirmed: bool | None = None
@@ -258,13 +278,41 @@ class Controller:
         """Bring every servo to a known state (torque off) before the first cycle.
 
         A previous session may have crashed with joints holding; starting from torque-off
-        means nothing moves until the operator arms joints explicitly.
+        means nothing moves until the operator arms joints explicitly. Joints that do not
+        reply become offline.
         """
-        confirmed = self._torque_off_all()
-        self._emit("info" if confirmed else "error",
-                   "startup: torque off confirmed on all joints" if confirmed
-                   else "startup: could not confirm torque off on all joints (check power and wiring)")
+        self._online = set(self.joints)
+        self._torque_off_all()
+        replies = self._torque_off_replies
+        self._online = {i for i, reading in replies.items() if reading is not None}
+        offline = sorted(set(self.joints) - self._online)
+        for servo_id in offline:
+            self._fail_counts[servo_id] = 0
+        confirmed = bool(self._online) and all(replies[i].torque == 0 for i in self._online)  # type: ignore[union-attr]
+        self._torque_off_confirmed = confirmed
+        hint = f"; offline (no reply): {offline} - connect them and press Rescan bus" if offline else ""
+        if not self._online:
+            self._emit("error", "startup: no joint replied (check servo power and wiring)")
+        elif confirmed:
+            self._emit("info", f"startup: torque off confirmed on {len(self._online)} joint(s){hint}")
+        else:
+            self._emit("error", f"startup: could not confirm torque off on every responding joint{hint}")
+        self._take_census("startup")
         return confirmed
+
+    def _take_census(self, context: str) -> None:
+        try:
+            census = ensure_census(self.bus)
+        except CensusError as exc:
+            self._emit("error", f"{context}: bus census failed, arming is refused until a successful rescan: {exc}")
+            return
+        shared = {i: sorted(census.get(i, frozenset()) - {i}) for i in self.joints}
+        for servo_id, others in shared.items():
+            if others:
+                self._emit("error", f"{context}: joint ID {servo_id} is also the secondary ID of HLS servo(s) "
+                                    f"{others}; it cannot be armed")
+        self._emit("info", f"{context}: bus census done, "
+                           + (f"HLS secondary IDs {sorted(census)}" if census else "no HLS servo found"))
 
     def _run(self) -> None:
         period = 1.0 / self.motion.cycle_hz
@@ -358,13 +406,17 @@ class Controller:
         self._single = None
         self._sent.clear()
         self._finish_trace(stopped=True)
-        ids = list(self.joints)
-        self.bus.sync_write(REG_TORQUE_ENABLE, 1, {i: b"\x00" for i in ids})
+        # The broadcast covers offline joints too; acknowledged writes and read-backs go to online joints only,
+        # so an E-stop never waits for reply timeouts of servos that are not there.
+        self.bus.sync_write(REG_TORQUE_ENABLE, 1, {i: b"\x00" for i in self.joints})
+        ids = [i for i in self.joints if i in self._online]
         for servo_id in ids:
             self.bus.write_byte(servo_id, REG_TORQUE_ENABLE, 0)
         confirmed = True
+        self._torque_off_replies = {}
         for servo_id in ids:
-            reading = read_status(self.bus, servo_id)
+            reading = read_status(self.bus, servo_id, self._models[servo_id])
+            self._torque_off_replies[servo_id] = reading
             self._store_reading(servo_id, reading, self._clock())
             confirmed &= reading is not None and reading.torque == 0
         self._torque_off_confirmed = confirmed
@@ -391,11 +443,18 @@ class Controller:
 
     def _handle(self, command: Command, now: float) -> None:
         if isinstance(command, ArmJoints):
-            for servo_id in command.ids:
+            ids = command.ids
+            if len(ids) > 1:
+                skipped = [i for i in ids if i not in self._online]
+                if skipped:
+                    self._emit("info", f"arm: offline IDs {skipped} skipped")
+                ids = tuple(i for i in ids if i in self._online)
+            for servo_id in ids:
                 self._arm(servo_id)
         elif isinstance(command, DisarmJoints):
             for servo_id in command.ids:
-                self._disarm(servo_id, "operator")
+                if servo_id in self._online or servo_id in self.policy.armed:
+                    self._disarm(servo_id, "operator")
         elif isinstance(command, ResetFaults):
             self._reset_faults()
         elif isinstance(command, SetMode):
@@ -417,6 +476,8 @@ class Controller:
             self._playback(command, now)
         elif isinstance(command, StopMotion):
             self._stop_motion("operator")
+        elif isinstance(command, RescanBus):
+            self._rescan()
 
     def _arm(self, servo_id: int) -> None:
         name = self._name(servo_id)
@@ -433,6 +494,8 @@ class Controller:
             reason = "recording in progress (teach needs torque off)"
         elif servo_id in self.policy.armed:
             return
+        elif servo_id not in self._online:
+            reason = "offline (no reply at startup); connect it and press Rescan bus"
         if reason:
             self._emit("warn", f"arm {name} refused: {reason}")
             return
@@ -443,7 +506,7 @@ class Controller:
         joint = self.joints[servo_id]
         assert joint.min_position is not None and joint.max_position is not None
         position = float(result.reading.position)
-        self._limiters[servo_id] = RateLimiter(position, joint.max_speed, self.motion.acceleration,
+        self._limiters[servo_id] = RateLimiter(position, joint.max_speed, self._acceleration(servo_id),
                                                joint.min_position, joint.max_position)
         self._sent[servo_id] = position
         self._emit("info", f"{name} armed, holding {result.reading.position}")
@@ -469,6 +532,42 @@ class Controller:
         confirmed = disarm_joint(self.bus, self.policy, servo_id)
         level = "info" if confirmed else "error"
         self._emit(level, f"{self._name(servo_id)} torque off ({why})" + ("" if confirmed else " NOT confirmed"))
+
+    def _rescan(self) -> None:
+        """Refresh the online set and the HLS secondary-ID census; only while nothing moves or is armed."""
+        if self.policy.armed:
+            busy = "disarm all joints first"
+        elif self._recording is not None:
+            busy = "recording in progress"
+        elif self._plan is not None or self._single is not None:
+            busy = "a move is in progress"
+        else:
+            busy = None
+        if busy:
+            self._emit("warn", f"rescan refused: {busy}")
+            return
+        now = self._clock()
+        online = set()
+        for servo_id in self.joints:
+            model = self._models[servo_id]
+            reading = read_status(self.bus, servo_id, model) or read_status(self.bus, servo_id, model)
+            if reading is not None:
+                online.add(servo_id)
+                self._store_reading(servo_id, reading, now)
+            else:
+                self._readings[servo_id] = None
+                self._fail_counts[servo_id] = 0
+        joined = sorted(online - self._online)
+        self._online = online
+        for servo_id in joined:
+            # A servo plugged in mid-session may hold torque from an earlier session.
+            self.bus.write_byte(servo_id, REG_TORQUE_ENABLE, 0)
+        self._supervisor.reset()
+        self.bus.census = None
+        offline = sorted(set(self.joints) - online)
+        self._emit("info", f"rescan: online {sorted(online)}" + (f", newly connected {joined}" if joined else "")
+                           + (f"; offline {offline}" if offline else ""))
+        self._take_census("rescan")
 
     def _reset_faults(self) -> None:
         self._estop_latched = False
@@ -527,17 +626,23 @@ class Controller:
         if goal is None:
             return
         if command.single_write:
+            registers = {i: self.policy.limits[i].max_speed for i in goal}
+            too_slow = sorted(i for i, register in registers.items() if register is None)
+            if too_slow:
+                self._emit("warn", f"single-write move '{command.label}' refused: max_speed of IDs {too_slow} is "
+                                   "below one speed-register unit")
+                return
             self._stop_motion(f"single-write move '{command.label}'")
             ids = list(goal)
             self._single = SingleWriteMove(command.label, {i: round(goal[i]) for i in ids},
-                                           {i: self.joints[i].max_speed for i in ids})
+                                           {i: registers[i] for i in ids})  # type: ignore[misc]
             self._start_trace(command.label, goal, now, mode="single write")
             self._plan_targets = dict(goal)
             return
         start = {i: self._limiters[i].position for i in goal}
         speeds = {i: float(self.joints[i].max_speed) for i in goal}
         self._plan = plan_move(start, goal, speeds, now, self.motion.min_move_duration_s, command.label,
-                               acceleration=self.motion.acceleration * PLAN_ACCEL_FRACTION)
+                               acceleration={i: self._acceleration(i) * PLAN_ACCEL_FRACTION for i in goal})
         self._start_trace(command.label, goal, now)
         span = self._plan.end - now
         self._emit("info", f"move '{command.label}' started ({len(goal)} joints, {span:.1f} s)")
@@ -547,7 +652,9 @@ class Controller:
         if self.mode is not Mode.JOG or limiter is None:
             self._emit("warn", f"jog {self._name(command.servo_id)} ignored (jog mode and armed joint required)")
             return
-        limiter.set_target(limiter.target + command.delta)
+        # Jog steps are SCS0009 steps: the same angle on every model.
+        delta = self._models[command.servo_id].scs_steps(abs(command.delta))
+        limiter.set_target(limiter.target + (delta if command.delta > 0 else -delta))
 
     def _start_recording(self, now: float) -> None:
         if self.mode is not Mode.TEACH:
@@ -566,7 +673,8 @@ class Controller:
             return
         frames = self._recording
         self._recording = None
-        keyframes = compress_keyframes(frames, self.motion.keyframe_tolerance_steps)
+        keyframes = compress_keyframes(frames, {i: m.scs_steps(self.motion.keyframe_tolerance_steps)
+                                                for i, m in self._models.items()})
         self._finished_recording = keyframes
         outside = sorted({i for kf in keyframes for i, v in kf.positions.items() if not self._within(i, v)})
         note = f"; positions outside travel on IDs {outside} (cannot be saved)" if outside else ""
@@ -598,7 +706,7 @@ class Controller:
         speeds = {i: float(self.joints[i].max_speed) for i in joints}
         try:
             self._plan = plan_playback(command.keyframes, start, speeds, now, scale, self.motion.min_move_duration_s,
-                                       acceleration=self.motion.acceleration * PLAN_ACCEL_FRACTION)
+                                       acceleration={i: self._acceleration(i) * PLAN_ACCEL_FRACTION for i in joints})
         except ValueError as exc:
             self._emit("warn", f"playback refused: {exc}")
             return
@@ -637,8 +745,9 @@ class Controller:
         speeds = {}
         for servo_id, setpoint in setpoints.items():
             limiter = self._limiters.get(servo_id)
-            speeds[servo_id] = self.motion.stream_speed(limiter.velocity if limiter else 0.0)
-            entries[servo_id] = goal_block(round(setpoint), speeds[servo_id])
+            speeds[servo_id] = self.motion.stream_register(self._models[servo_id], limiter.velocity if limiter else 0.0,
+                                                           self.joints[servo_id].max_speed)
+            entries[servo_id] = self.policy.encode_goal(servo_id, round(setpoint), speeds[servo_id])
         try:
             self.bus.sync_write(REG_GOAL_BLOCK, GOAL_BLOCK_LEN, entries)
         except UnsafeOperationError as exc:
@@ -665,7 +774,8 @@ class Controller:
         else:
             fresh = {i: self._fresh.get(i) for i in move.goals}
             far = {i: None if r is None else r.position for i, r in fresh.items()
-                   if r is None or abs(r.position - move.goals[i]) > SINGLE_WRITE_ARRIVAL_STEPS}
+                   if r is None or abs(r.position - move.goals[i])
+                   > self._models[i].scs_steps(SINGLE_WRITE_ARRIVAL_STEPS)}
             if not far:
                 self._end_single_write(move, now)
                 self._emit("info", f"single-write move '{move.label}' finished ({now - move.sent_at:.2f} s, "
@@ -686,7 +796,7 @@ class Controller:
             self._emit("warn", f"single-write move '{move.label}' refused: torque not confirmed on IDs {off}")
             return
         authorized = {i: (move.goals[i], move.speeds[i]) for i in move.goals}
-        entries = {i: goal_block(position, speed) for i, (position, speed) in authorized.items()}
+        entries = {i: self.policy.encode_goal(i, position, speed) for i, (position, speed) in authorized.items()}
         try:
             with self.policy.authorize_goals(authorized):
                 self.bus.sync_write(REG_GOAL_BLOCK, GOAL_BLOCK_LEN, entries)
@@ -695,8 +805,8 @@ class Controller:
             self._latch_global(f"single-write move refused by motion policy: {exc}")
             self._torque_off_all()
             return
-        durations = {i: abs(move.goals[i] - r.position) / move.speeds[i]  # type: ignore[union-attr]
-                     for i, r in readings.items()}
+        durations = {i: abs(move.goals[i] - r.position)  # type: ignore[union-attr]
+                     / self._models[i].steps_per_s(move.speeds[i]) for i, r in readings.items()}
         move.sent_at = now
         move.expected_s = max(durations.values()) + SINGLE_WRITE_LATENCY_S
         move.deadline = now + move.expected_s * SINGLE_WRITE_TIMEOUT_FACTOR + SINGLE_WRITE_TIMEOUT_MARGIN_S
@@ -730,12 +840,12 @@ class Controller:
                 continue  # the supervisor handles a joint that lost torque or communication
             assert joint.min_position is not None and joint.max_position is not None
             hold[servo_id] = min(max(reading.position, joint.min_position), joint.max_position)
-        speeds = {i: min(self.motion.arm_speed, self.joints[i].max_speed) for i in hold}
+        speeds = {i: min(self.motion.arm_register(self._models[i]), move.speeds[i]) for i in hold}
         if hold:
             try:
                 with self.policy.authorize_goals({i: (hold[i], speeds[i]) for i in hold}):
                     self.bus.sync_write(REG_GOAL_BLOCK, GOAL_BLOCK_LEN,
-                                        {i: goal_block(hold[i], speeds[i]) for i in hold})
+                                        {i: self.policy.encode_goal(i, hold[i], speeds[i]) for i in hold})
             except UnsafeOperationError as exc:
                 self._latch_global(f"single-write hold refused by motion policy: {exc}")
                 self._torque_off_all()
@@ -768,7 +878,10 @@ class Controller:
         for servo_id in self.joints:
             if self._estop.is_set():
                 return
-            reading = read_status(self.bus, servo_id)
+            if servo_id not in self._online:
+                self._fresh[servo_id] = None
+                continue
+            reading = read_status(self.bus, servo_id, self._models[servo_id])
             self._fresh[servo_id] = reading
             self._store_reading(servo_id, reading, self._clock())
 
@@ -784,8 +897,10 @@ class Controller:
                 armed=servo_id in self.policy.armed,
                 sent_setpoint=self._sent.get(servo_id) if servo_id in self.policy.armed else None,
                 free_running=servo_id in free,
+                current_cap_ma=self._current_cap_ma(servo_id),
             )
             for servo_id in self.joints
+            if servo_id in self._online
         }
         heartbeat_age = now - self._heartbeat if self.motion.heartbeat_freeze_s is not None else None
         result = self._supervisor.evaluate(now, inputs, heartbeat_age)
@@ -826,10 +941,11 @@ class Controller:
         if now - self._last_record_t < 1.0 / self.motion.teach_rate_hz - 1e-6:
             return
         fresh = self._fresh
-        if any(fresh.get(i) is None for i in self.joints):
+        online = [i for i in self.joints if i in self._online]
+        if not online or any(fresh.get(i) is None for i in online):
             return
         self._last_record_t = now
-        positions = {i: fresh[i].position for i in self.joints}  # type: ignore[union-attr]
+        positions = {i: fresh[i].position for i in online}  # type: ignore[union-attr]
         self._recording.append(Keyframe(round(now - self._record_t0, 4), positions))
 
     # ------------------------------------------------------------------ publishing
@@ -860,6 +976,8 @@ class Controller:
                 setpoint=self._sent.get(servo_id),
                 fault=self._joint_faults.get(servo_id),
                 warnings=tuple(warnings.get(servo_id, ())),
+                model=self._models[servo_id],
+                online=servo_id in self._online,
             )
         snapshot = HandSnapshot(
             time=now,
@@ -878,6 +996,7 @@ class Controller:
             cycle_busy_ms=self._busy_ms,
             cycle_budget_ms=1000.0 / self.motion.cycle_hz,
             notes=tuple(self._last_result.blocking),
+            offline=tuple(i for i in self.joints if i not in self._online),
         )
         with self._snapshot_lock:
             self._snapshot = snapshot
@@ -889,7 +1008,9 @@ class Controller:
         self._plan_targets = {}
         self._trace_mode = mode or self.motion.stream_speed_mode
         names = {i: self.joints[i].name for i in goals}
-        self._trace = TraceRecorder(label, now, {i: float(v) for i, v in goals.items()}, names)
+        tolerances = {i: float(self._models[i].scs_steps(3)) for i in goals}
+        self._trace = TraceRecorder(label, now, {i: float(v) for i, v in goals.items()}, names,
+                                    tolerances=tolerances)
 
     def _trace_cycle(self, now: float) -> None:
         trace = self._trace
@@ -941,6 +1062,15 @@ class Controller:
             self._busy_streak = 0
 
     # ------------------------------------------------------------------ helpers
+
+    def _acceleration(self, servo_id: int) -> float:
+        """MotionConfig.acceleration (SCS0009 steps/s^2) in the joint's own steps/s^2."""
+        return self.motion.acceleration * self._models[servo_id].step_scale
+
+    def _current_cap_ma(self, servo_id: int) -> float | None:
+        cap = self.policy.current_cap(servo_id)
+        per_unit = self._models[servo_id].current_ma_per_unit
+        return None if cap is None or per_unit is None else cap * per_unit
 
     def _within(self, servo_id: int, value: float) -> bool:
         joint = self.joints.get(servo_id)

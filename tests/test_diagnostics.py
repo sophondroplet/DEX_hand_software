@@ -3,10 +3,20 @@ from __future__ import annotations
 import io
 import json
 
+import pytest
 from fake_bus import FakeBus, FakeServo
 from rich.console import Console
 
-from dexhand_servo.diagnostics import Severity, Verdict, run_diagnose
+from dexhand_servo.diagnostics import (
+    PortCandidate,
+    PortKind,
+    PortSelectionError,
+    Severity,
+    Verdict,
+    port_kind,
+    run_diagnose,
+    select_port,
+)
 from dexhand_servo.report import diagnose_to_dict, render_diagnose, write_json
 
 READ_ONLY_INSTRUCTIONS = {0x01, 0x02}
@@ -148,3 +158,75 @@ def test_joint_travel_checks(open_bus, cfg) -> None:
     assert "[4]" in fleet["joint travel limits"]
     assert "[5]" in fleet["joint map"]
     assert report.exit_code == 1
+
+
+def test_real_hls_servo_is_identified_and_decoded(open_bus, cfg) -> None:
+    from dataclasses import replace
+
+    from hls_fixture import real_hls_servo
+
+    from dexhand_servo.models import HLS3606
+
+    fake = FakeBus([real_hls_servo(1), FakeServo(2, position=500)])
+    report = run_diagnose(open_bus(fake), replace(cfg, joints={}), ids=(1, 2, 3))
+    hls, scs = report.servos
+    assert hls.dump.model is HLS3606 and scs.dump.model is not HLS3606
+    assert hls.dump.decoded["torque_limit"].value == 100.0 and hls.dump.decoded["lock"].value == 1
+    assert hls.assessment.positions and set(hls.assessment.positions) == {4}
+    flagged = {c.name for c in hls.checks if c.severity is not Severity.PASS}
+    assert flagged == {"servo angle limits", "supply voltage"}
+    assert all(c.severity is Severity.PASS for c in scs.checks), scs.checks
+    assert set(fake.instructions) <= READ_ONLY_INSTRUCTIONS
+
+
+def test_model_mismatch_and_secondary_id_collision(open_bus, cfg) -> None:
+    from dataclasses import replace
+
+    from hls_fixture import real_hls_servo
+
+    from dexhand_servo.config import JointConfig
+
+    hls = real_hls_servo(1)
+    hls.regs[7] = 2  # secondary ID equal to the SCS servo's ID
+    fake = FakeBus([hls, FakeServo(2, position=500)])
+    joints = {1: JointConfig("thumb"), 2: JointConfig("index")}
+    report = run_diagnose(open_bus(fake), replace(cfg, joints=joints), ids=(1, 2))
+    model_check = next(c for c in report.servos[0].checks if c.name == "servo model")
+    assert model_check.severity is Severity.FAIL and "scs0009" in model_check.detail
+    fleet = {c.name: c for c in report.fleet_checks}
+    assert fleet["secondary ID"].severity is Severity.FAIL and "ID 2" in fleet["secondary ID"].detail
+
+
+def _port(device: str, kind: PortKind) -> PortCandidate:
+    return PortCandidate(device, "", 0, 0, kind)
+
+
+BRIDGE = _port("/dev/cu.usbmodem1101", PortKind.BRIDGE)
+URT2 = _port("/dev/cu.wchusbserial110", PortKind.WCH)
+OTHER = _port("/dev/cu.usbmodem9", PortKind.OTHER)
+
+
+def test_port_kind_needs_the_bridge_product_name() -> None:
+    assert port_kind(0x303A, "Dexhand URT Bridge") is PortKind.BRIDGE
+    assert port_kind(0x303A, "USB JTAG/serial debug unit") is PortKind.OTHER  # some other ESP32
+    assert port_kind(0x1A86, "USB Single Serial") is PortKind.WCH
+
+
+@pytest.mark.parametrize("candidates, expected", [
+    ([BRIDGE, OTHER], BRIDGE.device),
+    ([URT2, OTHER], URT2.device),
+    ([OTHER], OTHER.device),
+])
+def test_select_port_picks_the_only_adapter(candidates, expected) -> None:
+    assert select_port(candidates, None) == expected
+
+
+def test_select_port_never_guesses_between_bridge_and_urt2() -> None:
+    with pytest.raises(PortSelectionError, match="ESP32 bridge.*URT-2 USB"):
+        select_port([BRIDGE, URT2], None)
+    assert select_port([BRIDGE, URT2], URT2.device) == URT2.device
+
+
+def test_select_port_without_ports() -> None:
+    with pytest.raises(PortSelectionError, match="No USB serial adapter"):
+        select_port([], None)
